@@ -11,9 +11,12 @@ QUERY_LIMIT_EXCEEDED → понятные сообщения через B24Error
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+log = logging.getLogger("workday")
 
 from .config import Config
 
@@ -285,6 +288,73 @@ class B24:
         if isinstance(result, dict):
             return result.get("item") if isinstance(result.get("item"), dict) else result
         return {"result": result}
+
+    def resolve_users(self, ids: List[int]) -> Dict[int, str]:
+        """Резолвинг user id → «Фамилия Имя Отчество» через read-only user.get.
+
+        Принимает список целых user id. Возвращает словарь {id: ФИО}.
+        Повторные вызовы для одних и тех же id используют внутренний кэш
+        (user.get НЕ вызывается дважды для одного пользователя).
+        Если пользователь не найден или поля имени пусты — fallback «id <N>».
+        Только чтение: user.get не изменяет данные.
+        """
+        if not hasattr(self, "_user_cache"):
+            self._user_cache: Dict[int, str] = {}
+
+        missing = [uid for uid in ids if uid not in self._user_cache]
+        if missing:
+            # Запрашиваем пачкой (user.get поддерживает filter по ID).
+            try:
+                response = self.call("user.get", {"filter": {"ID": missing}})
+            except B24Error as exc:
+                log.warning("Не удалось резолвить пользователей %s: %s", missing, exc)
+                response = {}
+
+            users: List[Dict[str, Any]] = []
+            result = response.get("result")
+            if isinstance(result, list):
+                users = result
+            elif isinstance(result, dict):
+                # Иногда user.get возвращает одиночный словарь.
+                users = [result]
+
+            resolved_ids = set()
+            for user in users:
+                def _pick(u: Dict[str, Any], *keys: str) -> str:
+                    for k in keys:
+                        v = u.get(k)
+                        if v not in (None, ""):
+                            return str(v).strip()
+                    return ""
+
+                raw_id = _pick(user, "ID", "id")
+                if not raw_id:
+                    continue
+                try:
+                    uid = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+
+                last = _pick(user, "LAST_NAME", "lastName", "last_name")
+                first = _pick(user, "NAME", "name")
+                second = _pick(user, "SECOND_NAME", "secondName", "second_name")
+                full_name = " ".join(p for p in (last, first, second) if p).strip()
+                self._user_cache[uid] = full_name or f"id {uid}"
+                resolved_ids.add(uid)
+
+            # Fallback для тех, кого не вернул user.get.
+            for uid in missing:
+                if uid not in resolved_ids:
+                    self._user_cache[uid] = f"id {uid}"
+
+            log.debug(
+                "resolve_users: запрошено %d, из кэша пропущено %d, получено из API %d",
+                len(ids),
+                len(ids) - len(missing),
+                len(resolved_ids),
+            )
+
+        return {uid: self._user_cache[uid] for uid in ids if uid in self._user_cache}
 
     def batch(self, commands: Dict[str, str], *, halt: int = 0) -> Dict[str, Any]:
         """Пакетный вызов до 50 команд за раз (для массовых чтений).

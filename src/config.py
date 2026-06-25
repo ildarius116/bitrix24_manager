@@ -83,6 +83,30 @@ class Config:
     def field_workday_works(self) -> str:
         return str(self.fields["workday_works"])
 
+    @property
+    def field_workday_employee(self) -> str:
+        return str(self.fields["workday_employee"])
+
+    @property
+    def field_log_parent(self) -> str:
+        return str(self.fields["log_parent"])
+
+    @property
+    def field_log_contract(self) -> str:
+        return str(self.fields["log_contract"])
+
+    @property
+    def field_log_description(self) -> str:
+        return str(self.fields["log_description"])
+
+    @property
+    def field_log_hours(self) -> str:
+        return str(self.fields["log_hours"])
+
+    @property
+    def field_log_result(self) -> str:
+        return str(self.fields["log_result"])
+
 
 def _require_env(name: str, *, secret: bool = False) -> str:
     """Достать обязательную переменную окружения, иначе — понятная ошибка.

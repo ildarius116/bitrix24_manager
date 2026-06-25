@@ -10,13 +10,14 @@
 - `phase_1_03_smoke_access.md` — smoke-доступ + обработка ошибок
 - Отчёт: `../tasks_done/phase_1_done.md` (2026-06-25)
 
-## Фаза 2 — Парсинг (FR-1)
+## Фаза 2 — Парсинг (FR-1) [DONE]
 - `phase_2_00_overview.md`
 - `phase_2_01_read_days.md` — чтение дней 1208 за период
 - `phase_2_02_read_logs.md` — связанные учёты 1218 (batch)
 - `phase_2_03_excel_main_sheet.md` — основной лист Excel
 - `phase_2_04_grouping_sheet.md` — лист группировки (FR-1.2)
 - `phase_2_05_time_range_meta.md` — рамки данных + лист метаданных (FR-1.1.6)
+- Отчёт: `../tasks_done/phase_2_done.md` (2026-06-25)
 
 ## Фаза 3 — Отбор кандидатов (FR-2.1.1–2.1.5) [мелкая]
 - `phase_3_01_select_candidates.md`
