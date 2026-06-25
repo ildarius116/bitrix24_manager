@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# runtime artifacts
+/out/
+/.runtime/
+storage_state.json
+
+# python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+.claude/

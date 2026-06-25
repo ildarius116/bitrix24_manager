@@ -1,0 +1,30 @@
+# Конфигурация проекта (несекретная). Секрет вебхука — в .env.
+# Метамодель подтверждена дискавери (PRD §2.6).
+
+entity:
+  workday_type_id: 1208           # «Рабочий день»
+  timelog_type_id: 1218           # «Учёт рабочего времени»
+
+fields:
+  workday_date: ufCrm46_1742342657      # дата рабочего дня
+  workday_works: ufCrm46_1742997115     # массив ID учётов («Работы/задачи за день»)
+  log_parent: parentId1208              # ссылка учёта на день
+  log_contract: ufCrm48_1742996936      # Договор/ТКП/Шаблонные задачи
+  log_description: ufCrm48_1744239302   # Описание задачи
+  log_hours: ufCrm48_1742996959         # Количество часов
+
+# Значение поля «Договор» для «Общие задачи подразделения» (наблюдаемое в реальных записях)
+contract_general_tasks: "T512_2"
+
+edit_window_days: 4               # FR-2.1.3 (календарные дни, включительно)
+
+defaults:                         # §6: дефолт + подтверждение
+  task_description: "Общие задачи подразделения"
+  hours: 8
+
+export:
+  output_dir: ./out
+  filename_pattern: "workday_{date_from}_{date_to}.xlsx"
+
+runtime:
+  interaction: true               # true = спрашивать подтверждение; false = автозапуск
