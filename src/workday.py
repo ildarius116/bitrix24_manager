@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .b24 import B24
@@ -298,3 +298,84 @@ def data_time_range(days: List[WorkdayDay]) -> Tuple[Optional[date], Optional[da
     if not dated:
         return None, None, 0
     return min(dated), max(dated), len(dated)
+
+
+def select_candidates(
+    days: List[WorkdayDay],
+    cfg: Config,
+    today: date,
+    *,
+    limit: int = 5,
+) -> List[WorkdayDay]:
+    """Отобрать дни «Рабочий день», которым нужно создать учёт (FR-2.1.1–2.1.5).
+
+    Алгоритм (порядок фильтров):
+    1. Рассматриваем только первые `limit` дней (топ по убыванию id, FR-2.1.1).
+       Вызывающий обязан передать список, уже отсортированный id desc (read_days это гарантирует).
+    2. Дни без распознанной даты (day.date is None) — пропуск «нет даты» (FR-2.1.2).
+    3. 4-дневное окно (FR-2.1.3): оставить только дни, у которых
+       today − cfg.edit_window_days <= day.date <= today (включительно с обеих сторон;
+       будущие даты > today тоже отсекаются). Семантика совпадает с within_edit_window из dates.py.
+    4. Пустота (FR-2.1.4/5): оставить только дни с пустым works_ids — значит учётов ещё нет.
+
+    Каждый пропущенный день логируется через log.info с понятной причиной на русском.
+    Каждый отобранный кандидат тоже логируется.
+
+    Параметры:
+        days    — список WorkdayDay, отсортированный id desc (обычно из read_days).
+        cfg     — конфигурация; используется cfg.edit_window_days.
+        today   — «сегодня» в таймзоне Europe/Moscow (передаётся вызывающим через today_moscow()).
+        limit   — сколько верхних дней рассматривать (FR-2.1.1, дефолт = 5).
+
+    Возвращает список отобранных WorkdayDay (может быть пустым).
+    """
+    earliest: date = today - timedelta(days=cfg.edit_window_days)
+    candidates: List[WorkdayDay] = []
+
+    for day in days[:limit]:
+        # FR-2.1.2: дата не распознана.
+        if day.date is None:
+            log.info(
+                "День id=%d пропущен: нет даты (title=%r).",
+                day.id,
+                day.title,
+            )
+            continue
+
+        # FR-2.1.3: вне окна редактирования.
+        if not (earliest <= day.date <= today):
+            log.info(
+                "День id=%d пропущен: вне окна редактирования (дата %s, окно с %s по %s).",
+                day.id,
+                day.date.isoformat(),
+                earliest.isoformat(),
+                today.isoformat(),
+            )
+            continue
+
+        # FR-2.1.4/5: учёты уже заполнены.
+        if day.works_ids:
+            log.info(
+                "День id=%d пропущен: уже заполнено (%d учётов), дата %s.",
+                day.id,
+                len(day.works_ids),
+                day.date.isoformat(),
+            )
+            continue
+
+        log.info(
+            "День id=%d отобран как кандидат на заполнение (дата %s).",
+            day.id,
+            day.date.isoformat(),
+        )
+        candidates.append(day)
+
+    log.info(
+        "Отбор кандидатов завершён: рассмотрено %d из %d дней (limit=%d), "
+        "отобрано кандидатов: %d.",
+        min(limit, len(days)),
+        len(days),
+        limit,
+        len(candidates),
+    )
+    return candidates

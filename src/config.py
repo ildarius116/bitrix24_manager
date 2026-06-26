@@ -76,6 +76,11 @@ class Config:
         return int(self.entity["timelog_type_id"])
 
     @property
+    def timelog_category_id(self) -> int:
+        """ID воронки учёта «Работы/задачи по договорам» (63). Не хардкодить — из config.yaml."""
+        return int(self.entity["timelog_category_id"])
+
+    @property
     def field_workday_date(self) -> str:
         return str(self.fields["workday_date"])
 
@@ -96,6 +101,11 @@ class Config:
         return str(self.fields["log_contract"])
 
     @property
+    def field_log_contract_tech(self) -> str:
+        """Код поля [тех] ID договора (ufCrm48_1754894889), парного коду договора."""
+        return str(self.fields["log_contract_tech"])
+
+    @property
     def field_log_description(self) -> str:
         return str(self.fields["log_description"])
 
@@ -106,6 +116,11 @@ class Config:
     @property
     def field_log_result(self) -> str:
         return str(self.fields["log_result"])
+
+    @property
+    def contract_tech_id(self) -> str:
+        """[тех] строковый ID договора (defaults.contract_tech_id, напр. "2")."""
+        return str(self.defaults.get("contract_tech_id", ""))
 
 
 def _require_env(name: str, *, secret: bool = False) -> str:
@@ -195,6 +210,9 @@ def load_config(
     for key in ("workday_type_id", "timelog_type_id"):
         if key not in entity:
             raise ConfigError(f"В config.yaml отсутствует entity.{key}.")
+    # timelog_category_id и поля для записи 1218 нужны только для fill; при их отсутствии
+    # геттеры дадут KeyError на этапе записи. Здесь не делаем их обязательными, чтобы
+    # export продолжал работать на минимальной конфигурации.
     for key in ("workday_date", "workday_works"):
         if key not in fields:
             raise ConfigError(f"В config.yaml отсутствует fields.{key}.")

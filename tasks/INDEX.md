@@ -19,15 +19,18 @@
 - `phase_2_05_time_range_meta.md` — рамки данных + лист метаданных (FR-1.1.6)
 - Отчёт: `../tasks_done/phase_2_done.md` (2026-06-25)
 
-## Фаза 3 — Отбор кандидатов (FR-2.1.1–2.1.5) [мелкая]
+## Фаза 3 — Отбор кандидатов (FR-2.1.1–2.1.5) [DONE]
 - `phase_3_01_select_candidates.md`
+- Отчёт: `../tasks_done/phase_3_done.md` (2026-06-25)
 
-## Фаза 4 — Создание учёта (FR-2.1.6–2.1.10.4)
+## Фаза 4 — Создание учёта (FR-2.1.6–2.1.11) [DONE]
 - `phase_4_00_overview.md`
-- `phase_4_01_done_button_investigation.md` — наблюдение «Выполнено» (read-only)
-- `phase_4_02_values_prompt.md` — дефолт + подтверждение
-- `phase_4_03_create_log.md` — crm.item.add 1218 (plan→execute)
-- `phase_4_04_verify.md` — верификация перечитыванием
+- `phase_4_01_done_button_investigation.md` — наблюдение «Выполнено» (read-only) [DONE]
+- `phase_4_02_values_prompt.md` — дефолт + подтверждение [DONE]
+- `phase_4_03_create_log.md` — crm.item.add 1218 (plan→execute) [DONE]
+- `phase_4_04_verify.md` — верификация перечитыванием [DONE]
+- Отчёт: `../tasks_done/phase_4_done.md` (2026-06-26). Боевой тест на одном дне выполнен с явного
+  разрешения заказчика: учёт 1218 id=163736 под днём id=271557, верификация OK.
 
 ## Фаза 5 — Надёжность и эксплуатация
 - `phase_5_00_overview.md`

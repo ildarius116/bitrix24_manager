@@ -1,17 +1,25 @@
-"""Оффлайн-тесты агрегатов выгрузки: data_time_range и группировка (без сети).
+"""Оффлайн-тесты агрегатов выгрузки: data_time_range, группировка и select_candidates (без сети).
 
 Синтетические WorkdayDay/WorkLog; проверяем, что:
 - рамки дат вычисляются по фактическим датам (без None);
 - группировка по «Описанию задачи» считает кол-во/сумму часов/даты корректно;
-- сумма часов по группам сходится с суммой по основным строкам.
+- сумма часов по группам сходится с суммой по основным строкам;
+- select_candidates корректно применяет все фильтры (лимит, дата, окно, заполненность).
 """
 
 from __future__ import annotations
 
+import types
 from datetime import date
 
 from src.export_excel import NO_DESCRIPTION, _group_rows
-from src.workday import WorkdayDay, WorkLog, data_time_range
+from src.workday import WorkdayDay, WorkLog, data_time_range, select_candidates
+
+# Фиксированная «сегодня» для детерминированных тестов select_candidates.
+TODAY = date(2026, 6, 25)
+
+# Стаб Config: функция select_candidates использует только cfg.edit_window_days.
+_cfg = types.SimpleNamespace(edit_window_days=4)
 
 
 def _log(desc: str, hours, *, log_id: int = 0) -> WorkLog:
@@ -36,6 +44,23 @@ def _day(d, logs, *, day_id: int = 1) -> WorkdayDay:
         works_ids=[l.id for l in logs],
         raw={},
         logs=logs,
+    )
+
+
+def _bare_day(d, *, day_id: int = 1, works_ids=None) -> WorkdayDay:
+    """Создать WorkdayDay без учётов, с явным контролем works_ids.
+
+    Используется в тестах select_candidates: нужны дни только с датой и
+    works_ids, без реальных WorkLog-объектов.
+    """
+    return WorkdayDay(
+        id=day_id,
+        date=d,
+        title="Сотрудник | x",
+        employee="1244",
+        works_ids=works_ids if works_ids is not None else [],
+        raw={},
+        logs=[],
     )
 
 
@@ -114,3 +139,127 @@ def test_group_dates_deduplicated_per_group():
     rows = _group_rows(days)
     assert rows[0][3] == [date(2026, 6, 1)]
     assert rows[0][1] == 2  # но записей всё равно две
+
+
+# ---------------------------------------------------------------------------
+# select_candidates (Фаза 3, FR-2.1.1–2.1.5)
+# today=2026-06-25, edit_window_days=4 → earliest=2026-06-21
+# ---------------------------------------------------------------------------
+
+
+def test_select_candidates_happy_path():
+    """Корректный день (в окне, пустой works_ids) проходит и возвращается."""
+    day = _bare_day(TODAY, day_id=10)
+    result = select_candidates([day], _cfg, TODAY)
+    assert result == [day]
+
+
+def test_select_candidates_boundary_in_window():
+    """Граница окна: today − edit_window_days (2026-06-21) ПРОХОДИТ."""
+    earliest = TODAY - __import__("datetime").timedelta(days=_cfg.edit_window_days)  # 2026-06-21
+    day = _bare_day(earliest, day_id=20)
+    result = select_candidates([day], _cfg, TODAY)
+    assert len(result) == 1
+    assert result[0].id == 20
+
+
+def test_select_candidates_boundary_outside_window():
+    """Граница: today − (edit_window_days + 1) (2026-06-20) НЕ ПРОХОДИТ."""
+    from datetime import timedelta
+    too_old = TODAY - timedelta(days=_cfg.edit_window_days + 1)  # 2026-06-20
+    day = _bare_day(too_old, day_id=30)
+    result = select_candidates([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_candidates_future_date_excluded():
+    """Будущая дата (> today) отсекается (FR-2.1.3 — верхняя граница = today)."""
+    from datetime import timedelta
+    future = TODAY + timedelta(days=1)
+    day = _bare_day(future, day_id=40)
+    result = select_candidates([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_candidates_no_date_excluded():
+    """День с date=None пропускается (FR-2.1.2)."""
+    day = _bare_day(None, day_id=50)
+    result = select_candidates([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_candidates_filled_excluded():
+    """День с непустым works_ids отсекается как уже заполненный (FR-2.1.4/5)."""
+    day = _bare_day(TODAY, day_id=60, works_ids=[101, 102])
+    result = select_candidates([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_candidates_empty_works_ids_passes():
+    """День с пустым works_ids (явно []) проходит фильтр заполненности."""
+    day = _bare_day(TODAY, day_id=70, works_ids=[])
+    result = select_candidates([day], _cfg, TODAY)
+    assert len(result) == 1
+
+
+def test_select_candidates_default_limit_5():
+    """Дефолтный limit=5: из 7 подходящих дней возвращаются только первые 5 (FR-2.1.1)."""
+    # Список уже отсортирован id desc (как read_days гарантирует).
+    days = [_bare_day(TODAY, day_id=i) for i in range(100, 107)]  # 7 дней
+    result = select_candidates(days, _cfg, TODAY)
+    assert len(result) == 5
+    # Возвращаются первые 5 (id 100..104), а не 105/106.
+    returned_ids = [d.id for d in result]
+    assert returned_ids == [100, 101, 102, 103, 104]
+
+
+def test_select_candidates_explicit_limit():
+    """Явный limit=2: из 5 подходящих дней возвращается не более 2."""
+    days = [_bare_day(TODAY, day_id=i) for i in range(200, 205)]  # 5 дней
+    result = select_candidates(days, _cfg, TODAY, limit=2)
+    assert len(result) == 2
+    assert [d.id for d in result] == [200, 201]
+
+
+def test_select_candidates_limit_excludes_beyond_window():
+    """Дни за пределами limit не рассматриваются, даже если они подходят по дате."""
+    from datetime import timedelta
+    # Первые 5 — слишком старые, 6-й — в окне. limit=5 → 6-й даже не проверяется.
+    too_old = TODAY - timedelta(days=_cfg.edit_window_days + 1)  # 2026-06-20
+    days = [_bare_day(too_old, day_id=i) for i in range(300, 305)]  # 5 за пределами окна
+    days.append(_bare_day(TODAY, day_id=305))  # 6-й — в окне, но за limit
+    result = select_candidates(days, _cfg, TODAY, limit=5)
+    assert result == []
+
+
+def test_select_candidates_mixed_reasons():
+    """Комбинированный сценарий: несколько причин пропуска + один кандидат."""
+    from datetime import timedelta
+    # Список приходит отсортированным id desc (убывание).
+    days = [
+        _bare_day(TODAY + timedelta(days=1), day_id=1),        # будущая — пропуск
+        _bare_day(TODAY, day_id=2, works_ids=[99]),             # заполнено — пропуск
+        _bare_day(None, day_id=3),                              # нет даты — пропуск
+        _bare_day(TODAY - timedelta(days=_cfg.edit_window_days + 1), day_id=4),  # старее окна
+        _bare_day(TODAY, day_id=5),                             # кандидат
+    ]
+    result = select_candidates(days, _cfg, TODAY)
+    assert len(result) == 1
+    assert result[0].id == 5
+
+
+def test_select_candidates_empty_input():
+    """Пустой список дней → пустой результат (без исключений)."""
+    result = select_candidates([], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_candidates_all_dates_in_window_all_pass():
+    """Все дни в окне, все с пустым works_ids, все в пределах limit — все проходят."""
+    from datetime import timedelta
+    days = [
+        _bare_day(TODAY - timedelta(days=i), day_id=i)
+        for i in range(_cfg.edit_window_days + 1)  # 0..4 → даты 25..21
+    ]
+    result = select_candidates(days, _cfg, TODAY)
+    assert len(result) == len(days)  # все 5 проходят

@@ -23,8 +23,9 @@ from pathlib import Path
 
 from src.b24 import B24, B24Error
 from src.config import Config, ConfigError, load_config
-from src.dates import DateParseError, parse_cli_date
+from src.dates import DateParseError, parse_cli_date, today_moscow
 from src.export_excel import build_workbook
+from src.fill import run_fill
 from src.logging_setup import setup_logging
 from src.workday import read_days, read_logs
 
@@ -70,6 +71,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-interaction",
         action="store_true",
         help="Не спрашивать подтверждение (для автозапуска).",
+    )
+    fill_p.add_argument(
+        "--confirm-write",
+        action="store_true",
+        help=(
+            "ЯВНЫЙ гейт боевой записи в прод. Без него (или вместе с --dry-run) — только dry-run. "
+            "Боевой режим (crm.item.add 1218) — лишь при --confirm-write БЕЗ --dry-run."
+        ),
     )
 
     return parser
@@ -175,15 +184,89 @@ def _cmd_export(config: Config, args: argparse.Namespace) -> int:
 
 
 def _cmd_fill(config: Config, args: argparse.Namespace) -> int:
-    """Заглушка fill (фаза 1): подтвердить режим, ничего не писать."""
-    mode = "dry-run" if args.dry_run else "обычный (требует явного разрешения на запись)"
-    interaction = "без подтверждений" if args.no_interaction else "с подтверждением"
-    log.info(
-        "fill: режим=%s, %s (заглушка фазы 1 — запись в прод НЕ выполняется).",
-        mode,
-        interaction,
-    )
-    return 0
+    """Автозаполнение «Работы/задачи за день» — создание учётов 1218 (Фаза 4).
+
+    Гейт боевой записи (безопасность по умолчанию): реальная запись происходит ТОЛЬКО при
+    --confirm-write И БЕЗ --dry-run. По умолчанию (или при --dry-run) — dry_run=True.
+    Если заданы оба (--confirm-write и --dry-run) — побеждает dry-run (с предупреждением).
+    """
+    # Определение режима записи.
+    if args.confirm_write and args.dry_run:
+        log.warning(
+            "Заданы и --confirm-write, и --dry-run: побеждает dry-run, запись НЕ выполняется."
+        )
+        dry_run = True
+    elif args.confirm_write:
+        dry_run = False
+    else:
+        dry_run = True
+
+    interaction = not args.no_interaction
+    today = today_moscow()
+
+    # Ранняя проверка наличия полей, необходимых для записи 1218.
+    # Отдельные геттеры бросают KeyError при отсутствии ключа в config.yaml.
+    def _nonempty(value: str) -> str:
+        if not value:
+            raise KeyError(value)
+        return value
+
+    _fill_config_missing: list = []
+    _fill_checks = [
+        ("entity.timelog_category_id", lambda: config.timelog_category_id),
+        ("entity.timelog_type_id",     lambda: config.timelog_type_id),
+        ("fields.log_parent",          lambda: config.field_log_parent),
+        ("fields.log_contract",        lambda: config.field_log_contract),
+        ("fields.log_contract_tech",   lambda: config.field_log_contract_tech),
+        ("fields.log_description",     lambda: config.field_log_description),
+        ("fields.log_hours",           lambda: config.field_log_hours),
+        ("contract_general_tasks",     lambda: _nonempty(config.contract_general_tasks)),
+        ("defaults.contract_tech_id",  lambda: _nonempty(config.contract_tech_id)),
+        ("defaults.task_description",  lambda: config.defaults["task_description"]),
+        ("defaults.hours",             lambda: config.defaults["hours"]),
+    ]
+    for _label, _getter in _fill_checks:
+        try:
+            _getter()
+        except (KeyError, TypeError, ValueError):
+            _fill_config_missing.append(_label)
+    if _fill_config_missing:
+        log.error(
+            "Для команды fill в config.yaml не хватает полей записи 1218: %s. "
+            "Заполните entity.timelog_category_id / fields.log_* / defaults.",
+            ", ".join(_fill_config_missing),
+        )
+        return 2
+
+    if dry_run:
+        log.info(
+            "fill: режим DRY-RUN (%s). Запись в прод НЕ выполняется — только показ плана.",
+            "с подтверждением" if interaction else "без подтверждений",
+        )
+    else:
+        log.warning(
+            "БОЕВОЙ РЕЖИМ: будет выполнена запись в прод (crm.item.add 1218). "
+            "Окно 4 дней и пустота перепроверяются перед каждой записью."
+        )
+
+    b24 = B24(config)
+    try:
+        results = run_fill(
+            b24,
+            config,
+            dry_run=dry_run,
+            interaction=interaction,
+            today=today,
+        )
+    except ValueError as exc:
+        log.error("Ошибка значений/конфигурации при заполнении: %s", exc)
+        return 2
+    except (KeyboardInterrupt, EOFError):
+        log.warning("fill прерван пользователем (Ctrl+C / EOF). Запись не выполнена/прервана.")
+        return 2
+
+    has_errors = any(r["status"] == "error" or r.get("verify_ok") is False for r in results)
+    return 2 if has_errors else 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
