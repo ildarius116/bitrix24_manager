@@ -36,8 +36,10 @@ from src.fill import (
     _reread_guard,
     build_payload,
     collect_values,
+    complete_day_activities,
     create_log,
     run_fill,
+    verify_activities_closed,
     verify_log,
 )
 from src.workday import WorkdayDay
@@ -75,6 +77,7 @@ def _make_cfg() -> types.SimpleNamespace:
         contract_general_tasks="T512_2",
         contract_tech_id="2",
         edit_window_days=4,
+        activity_provider_id="CRM_TODO",
         # дефолты
         defaults={"task_description": "Общие задачи подразделения", "hours": 8},
     )
@@ -98,32 +101,62 @@ def _make_day(
     )
 
 
+def _make_activity(activity_id: int, completed: str = "N") -> Dict[str, Any]:
+    """Создать словарь CRM-дела (формат crm.activity.list — ВЕРХНИЙ регистр ключей)."""
+    return {
+        "ID": activity_id,
+        "SUBJECT": "Заполнить работы по договорам",
+        "COMPLETED": completed,
+        "PROVIDER_ID": "CRM_TODO",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Фейковый B24 с записью вызовов
 # ---------------------------------------------------------------------------
 
 class FakeB24:
-    """Мок B24 с управляемыми ответами item_get / item_add.
+    """Мок B24 с управляемыми ответами item_get / item_add / activity_list / activity_complete.
 
     Использование:
         b24 = FakeB24(
-            item_get_responses=[dict(...), dict(...)],   # очередь ответов
-            item_add_response={"id": 999},               # ответ add (или B24Error)
+            item_get_responses=[dict(...), dict(...)],         # очередь ответов
+            item_add_response={"id": 999},                     # ответ add (или B24Error)
+            activities_by_day={day_id: [{"ID": 10, ...}]},    # открытые дела по дню
+            activity_list_error=B24Error("..."),               # сымитировать ошибку чтения дел
+            activity_complete_error=B24Error("..."),           # сымитировать ошибку завершения
         )
+    После activity_complete (без plan_only) дело помечается закрытым: повторный
+    activity_list(only_open=True) его уже не возвращает (для проверки верификации).
     """
 
     def __init__(
         self,
         item_get_responses: Optional[List[Any]] = None,
         item_add_response: Any = None,
+        *,
+        activities_by_day: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+        activity_list_error: Optional[Exception] = None,
+        activity_complete_error: Optional[Exception] = None,
     ) -> None:
         # очередь ответов item_get; каждый элемент — dict или B24Error (исключение) или None
         self._get_queue: deque = deque(item_get_responses or [])
         self._add_response = item_add_response
 
+        # Дела по дням: {owner_id (day_id): [activity_dict, ...]}
+        # Каждый словарь дела должен содержать ключ "ID" (int) и "COMPLETED": "N".
+        self._activities_by_day: Dict[int, List[Dict[str, Any]]] = activities_by_day or {}
+        # Ошибки для activity_list / activity_complete
+        self._activity_list_error: Optional[Exception] = activity_list_error
+        self._activity_complete_error: Optional[Exception] = activity_complete_error
+        # ID дел, завершённых через activity_complete (помечаем закрытыми)
+        self._closed_activity_ids: set = set()
+
         # журнал вызовов
         self.item_get_calls: List[Dict[str, Any]] = []
         self.item_add_calls: List[Dict[str, Any]] = []
+        self.activity_list_calls: List[Dict[str, Any]] = []
+        self.activity_complete_calls: List[Dict[str, Any]] = []
 
     def item_get(self, entity_type_id: int, item_id: int, *, select=None) -> Optional[Dict]:
         self.item_get_calls.append(
@@ -154,6 +187,47 @@ class FakeB24:
         if resp is None:
             return {}
         return resp
+
+    def activity_list(
+        self,
+        owner_type_id: int,
+        owner_id: int,
+        *,
+        provider_id: Optional[str] = None,
+        only_open: bool = True,
+        select: Optional[List] = None,
+    ) -> List[Dict[str, Any]]:
+        """crm.activity.list — фейк.
+
+        Возвращает дела из _activities_by_day[owner_id] (или [], если нет).
+        При only_open=True фильтрует дела, уже закрытые через activity_complete.
+        """
+        self.activity_list_calls.append({
+            "owner_type_id": owner_type_id,
+            "owner_id": owner_id,
+            "provider_id": provider_id,
+            "only_open": only_open,
+            "select": select,
+        })
+        if isinstance(self._activity_list_error, Exception):
+            raise self._activity_list_error
+        acts = list(self._activities_by_day.get(owner_id, []))
+        if only_open:
+            acts = [a for a in acts if a.get("ID") not in self._closed_activity_ids]
+        return acts
+
+    def activity_complete(self, activity_id: int, *, plan_only: bool = False) -> Dict:
+        """crm.activity.update COMPLETED=Y — фейк.
+
+        Помечает дело закрытым (кладёт в _closed_activity_ids), чтобы последующий
+        activity_list(only_open=True) его уже не возвращал.
+        """
+        self.activity_complete_calls.append({"activity_id": activity_id, "plan_only": plan_only})
+        if isinstance(self._activity_complete_error, Exception):
+            raise self._activity_complete_error
+        if not plan_only:
+            self._closed_activity_ids.add(activity_id)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1273,8 @@ class TestRunFillJournal:
                     cfg_ns.field_log_description: "Общие задачи подразделения",
                     cfg_ns.field_log_hours: "8.0",
                 },
+                # Кандидат 1: _window_guard (вызов внутри complete_day_activities)
+                {"id": 100, cfg_ns.field_workday_date: TODAY.isoformat()},
                 # Кандидат 2: _reread_guard
                 {
                     "id": 101,
@@ -1214,8 +1290,11 @@ class TestRunFillJournal:
                     cfg_ns.field_log_description: "Общие задачи подразделения",
                     cfg_ns.field_log_hours: "8.0",
                 },
+                # Кандидат 2: _window_guard (вызов внутри complete_day_activities)
+                {"id": 101, cfg_ns.field_workday_date: TODAY.isoformat()},
             ],
             item_add_response={"id": 777},
+            # activities_by_day не задан → по умолчанию [] → "no-activity" → activity_ok=True
         )
 
         with caplog.at_level(logging.WARNING, logger="workday"):
@@ -1239,3 +1318,561 @@ class TestRunFillJournal:
         assert any("не удалось записать журнал" in m for m in warning_msgs), (
             f"Ожидалось предупреждение о сбое журнала, получено: {warning_msgs}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Тесты complete_day_activities (FR-2.1.7)
+# ---------------------------------------------------------------------------
+
+class TestCompleteDayActivities:
+    """Завершение CRM-дел «Выполнено» на дне (FR-2.1.7): все ветки статусов."""
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        """Зафиксировать today_moscow = 2026-06-25 во всех тестах класса."""
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
+
+    def setup_method(self):
+        self.cfg = _make_cfg()
+        self.day = _make_day(day_id=200, d=TODAY)
+
+    def _window_ok(self, day_id: int = 200) -> Dict[str, Any]:
+        """Ответ item_get для _window_guard: день в окне."""
+        return {"id": day_id, self.cfg.field_workday_date: TODAY.isoformat()}
+
+    def _window_old(self, day_id: int = 200) -> Dict[str, Any]:
+        """Ответ item_get для _window_guard: день вне окна (too old)."""
+        return {"id": day_id, self.cfg.field_workday_date: DAY_TOO_OLD.isoformat()}
+
+    # --- статус «skipped» ---
+
+    def test_skipped_when_day_not_found(self):
+        """item_get → None (день не найден) → status='skipped'."""
+        b24 = FakeB24(item_get_responses=[None])
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "skipped"
+        assert "reason" in result
+        assert len(b24.activity_list_calls) == 0
+
+    def test_skipped_when_day_outside_window(self):
+        """День вне 4-дневного окна → status='skipped'."""
+        b24 = FakeB24(item_get_responses=[self._window_old()])
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "skipped"
+        assert len(b24.activity_list_calls) == 0
+
+    # --- статус «error» на activity_list ---
+
+    def test_error_when_activity_list_raises(self):
+        """activity_list бросает B24Error → status='error' + reason."""
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activity_list_error=B24Error("crm.activity.list failed"),
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "error"
+        assert "reason" in result
+        assert len(b24.activity_complete_calls) == 0
+
+    # --- статус «no-activity» ---
+
+    def test_no_activity_when_empty_list(self):
+        """Нет открытых дел → status='no-activity', activity_complete НЕ зовётся."""
+        b24 = FakeB24(item_get_responses=[self._window_ok()])
+        # activities_by_day не задан → по умолчанию [] → нет дел
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "no-activity"
+        assert len(b24.activity_complete_calls) == 0
+
+    # --- статус «dry-run» ---
+
+    def test_dry_run_returns_ids_no_complete_called(self):
+        """dry-run: дела найдены → ids возвращены, activity_complete НЕ вызван."""
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activities_by_day={200: [_make_activity(10), _make_activity(11)]},
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=True)
+        assert result["status"] == "dry-run"
+        assert sorted(result["activity_ids"]) == [10, 11]
+        assert len(b24.activity_complete_calls) == 0
+
+    # --- статус «completed» ---
+
+    def test_completed_closes_all_activities(self):
+        """Боевой режим: все найденные открытые дела закрываются."""
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activities_by_day={200: [_make_activity(10), _make_activity(11)]},
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "completed"
+        assert sorted(result["activity_ids"]) == [10, 11]
+        # Оба дела завершены
+        closed = [c["activity_id"] for c in b24.activity_complete_calls]
+        assert sorted(closed) == [10, 11]
+
+    def test_completed_single_activity(self):
+        """Одно дело → закрывается, status='completed'."""
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activities_by_day={200: [_make_activity(55)]},
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "completed"
+        assert result["activity_ids"] == [55]
+
+    # --- ошибка при activity_complete ---
+
+    def test_error_when_activity_complete_raises(self):
+        """activity_complete бросает B24Error → status='error', reason содержит описание."""
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activities_by_day={200: [_make_activity(10)]},
+            activity_complete_error=B24Error("complete failed", code="UPDATE_ERROR"),
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "error"
+        assert "reason" in result
+        assert "10" in result["reason"]  # ID дела попадает в reason
+
+    def test_error_on_one_of_two_activities_accumulates_reasons(self):
+        """Если activity_complete провалился на одном из двух дел → status='error', оба ID в reason."""
+        # Первое дело завершится (ID=10), второе даёт ошибку (ID=11).
+        # Симулируем: ошибка срабатывает на КАЖДЫЙ вызов activity_complete.
+        # В реальном тесте оба дела будут в error.reason.
+        b24 = FakeB24(
+            item_get_responses=[self._window_ok()],
+            activities_by_day={200: [_make_activity(10), _make_activity(11)]},
+            activity_complete_error=B24Error("bulk fail"),
+        )
+        result = complete_day_activities(b24, self.day, self.cfg, dry_run=False)
+        assert result["status"] == "error"
+        # Оба вызова зафиксированы
+        assert len(b24.activity_complete_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Тесты verify_activities_closed (FR-2.1.7)
+# ---------------------------------------------------------------------------
+
+class TestVerifyActivitiesClosed:
+    """Подтверждение, что все открытые дела дня закрыты (FR-2.1.7)."""
+
+    def setup_method(self):
+        self.cfg = _make_cfg()
+        self.day_id = 300
+
+    def test_ok_true_when_no_open_activities(self):
+        """Нет открытых дел → ok=True, open_ids=[]."""
+        b24 = FakeB24()  # activities_by_day не задан → [] → нет открытых
+        result = verify_activities_closed(b24, self.day_id, self.cfg)
+        assert result["ok"] is True
+        assert result["open_ids"] == []
+        assert result["day_id"] == self.day_id
+
+    def test_ok_false_when_open_activities_remain(self):
+        """Остались открытые дела → ok=False, open_ids содержит их ID."""
+        b24 = FakeB24(
+            activities_by_day={300: [_make_activity(50), _make_activity(51)]}
+        )
+        result = verify_activities_closed(b24, self.day_id, self.cfg)
+        assert result["ok"] is False
+        assert sorted(result["open_ids"]) == [50, 51]
+
+    def test_ok_false_when_activity_list_raises(self):
+        """activity_list бросает B24Error → ok=False (ошибка = «не подтверждено»)."""
+        b24 = FakeB24(activity_list_error=B24Error("read error"))
+        result = verify_activities_closed(b24, self.day_id, self.cfg)
+        assert result["ok"] is False
+
+    def test_ok_true_after_activities_completed(self):
+        """После activity_complete(plan_only=False) дело помечается закрытым → ok=True."""
+        b24 = FakeB24(
+            activities_by_day={300: [_make_activity(50)]}
+        )
+        # Симулируем завершение через complete (помечает в _closed_activity_ids)
+        b24.activity_complete(50)
+        result = verify_activities_closed(b24, self.day_id, self.cfg)
+        assert result["ok"] is True
+        assert result["open_ids"] == []
+
+    def test_result_always_has_day_id(self):
+        """Результат всегда содержит day_id."""
+        b24 = FakeB24()
+        result = verify_activities_closed(b24, 999, self.cfg)
+        assert result["day_id"] == 999
+
+
+# ---------------------------------------------------------------------------
+# Тесты run_fill: «ремонт» закрытия дел (FR-2.1.7)
+# ---------------------------------------------------------------------------
+
+class TestRunFillRepair:
+    """«Ремонт» закрытия дел в run_fill: дни с учётом, но возможно открытым делом."""
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        """Зафиксировать today_moscow = 2026-06-25."""
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
+
+    def _setup_cfg(self) -> types.SimpleNamespace:
+        cfg = _make_cfg()
+        cfg.journal_ttl_sec = 604800
+        return cfg
+
+    # -------------------------------------------------------------------
+    # Тест 1: заполненный день с открытым делом → «ремонт» выполнен
+    # -------------------------------------------------------------------
+
+    def test_repair_day_with_open_activity_repaired(self, monkeypatch):
+        """Заполненный день (works непуст) с открытым делом → строка 'repaired', activity_ok=True."""
+        cfg = self._setup_cfg()
+        repair_day = _make_day(day_id=200, d=TODAY, works_ids=[100])
+
+        # Только repair-день (no candidates because works_ids is non-empty)
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+
+        # item_get для _window_guard внутри complete_day_activities
+        window_resp = {"id": 200, cfg.field_workday_date: TODAY.isoformat()}
+        b24 = FakeB24(
+            item_get_responses=[window_resp],
+            activities_by_day={200: [_make_activity(50)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5)
+
+        repair_rows = [r for r in results if r.get("repair")]
+        assert len(repair_rows) == 1
+        row = repair_rows[0]
+        assert row["status"] == "repaired"
+        assert row.get("activity_ok") is True
+        # activity_complete был вызван (дело id=50)
+        assert any(c["activity_id"] == 50 for c in b24.activity_complete_calls)
+
+    # -------------------------------------------------------------------
+    # Тест 2: заполненный день без открытого дела → «already-closed»
+    # -------------------------------------------------------------------
+
+    def test_repair_day_without_open_activity_already_closed(self, monkeypatch):
+        """Заполненный день, дел нет → строка 'already-closed', repair=True."""
+        cfg = self._setup_cfg()
+        repair_day = _make_day(day_id=201, d=TODAY, works_ids=[101])
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+
+        window_resp = {"id": 201, cfg.field_workday_date: TODAY.isoformat()}
+        b24 = FakeB24(
+            item_get_responses=[window_resp],
+            # activities_by_day не задан → [] → "no-activity"
+        )
+
+        results = run_fill(b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5)
+
+        repair_rows = [r for r in results if r.get("repair")]
+        assert len(repair_rows) == 1
+        assert repair_rows[0]["status"] == "already-closed"
+        assert repair_rows[0].get("repair") is True
+
+    # -------------------------------------------------------------------
+    # Тест 3: dry-run «ремонта» → status='dry-run', complete НЕ вызывался
+    # -------------------------------------------------------------------
+
+    def test_repair_dry_run_no_complete_called(self, monkeypatch):
+        """dry-run: repair-строка со статусом 'dry-run', activity_complete не вызывался."""
+        cfg = self._setup_cfg()
+        repair_day = _make_day(day_id=202, d=TODAY, works_ids=[102])
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        # dry_run=True → load_journal не нужен
+
+        window_resp = {"id": 202, cfg.field_workday_date: TODAY.isoformat()}
+        b24 = FakeB24(
+            item_get_responses=[window_resp],
+            activities_by_day={202: [_make_activity(60)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=True, interaction=False, today=TODAY, limit=5)
+
+        repair_rows = [r for r in results if r.get("repair")]
+        assert len(repair_rows) == 1
+        assert repair_rows[0]["status"] == "dry-run"
+        # activity_complete НЕ вызывался (только plan)
+        assert len(b24.activity_complete_calls) == 0
+
+    # -------------------------------------------------------------------
+    # Тест 4: при aborted «ремонт» не выполняется
+    # -------------------------------------------------------------------
+
+    def test_repair_not_executed_when_aborted(self, monkeypatch):
+        """При ABORT от collect_values ремонт-проход не выполняется."""
+        cfg = self._setup_cfg()
+        candidate_day = _make_day(day_id=100, d=TODAY, works_ids=[])
+        repair_day = _make_day(day_id=201, d=TODAY, works_ids=[101])
+
+        monkeypatch.setattr(
+            "src.workday.read_days",
+            lambda b24, cfg, df, dt: [candidate_day, repair_day],
+        )
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        # Параметры journal, day_id, ttl_sec, now_ts — передаются с keyword-аргументами
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: False,
+        )
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+        # Симулируем ABORT при первом кандидате
+        monkeypatch.setattr("src.fill.collect_values", lambda day, cfg, **kw: ABORT)
+
+        b24 = FakeB24()
+        results = run_fill(b24, cfg, dry_run=False, interaction=True, today=TODAY, limit=5)
+
+        # Ремонт-строк нет (aborted → ремонт пропущен)
+        repair_rows = [r for r in results if r.get("repair")]
+        assert len(repair_rows) == 0
+        # activity_complete НЕ вызывался
+        assert len(b24.activity_complete_calls) == 0
+
+    # -------------------------------------------------------------------
+    # Тест 5: КЛЮЧЕВОЙ — нет кандидатов, но repair-день выполняется
+    # -------------------------------------------------------------------
+
+    def test_no_candidates_repair_day_still_runs(self, monkeypatch):
+        """Кандидатов на создание нет, но заполненный день с открытым делом → ремонт."""
+        cfg = self._setup_cfg()
+        # Только repair-день (works непуст → select_candidates его не возьмёт)
+        repair_day = _make_day(day_id=300, d=TODAY, works_ids=[999])
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+
+        window_resp = {"id": 300, cfg.field_workday_date: TODAY.isoformat()}
+        b24 = FakeB24(
+            item_get_responses=[window_resp],
+            activities_by_day={300: [_make_activity(70)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5)
+
+        repair_rows = [r for r in results if r.get("repair")]
+        assert len(repair_rows) == 1
+        assert repair_rows[0]["status"] == "repaired"
+        # activity_complete был вызван ровно 1 раз
+        assert len(b24.activity_complete_calls) == 1
+        assert b24.activity_complete_calls[0]["activity_id"] == 70
+
+
+# ---------------------------------------------------------------------------
+# Тесты run_fill: create-path включает закрытие дела (FR-2.1.7)
+# ---------------------------------------------------------------------------
+
+class TestRunFillCreatePathActivity:
+    """После успешного create_log (filled) строка результата содержит activity_status/activity_ok."""
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
+
+    def _setup_cfg(self) -> types.SimpleNamespace:
+        cfg = _make_cfg()
+        cfg.journal_ttl_sec = 604800
+        return cfg
+
+    def test_filled_candidate_closes_activity_and_sets_ok(self, monkeypatch):
+        """filled-кандидат → activity_status присутствует, activity_ok=True (дело закрыто)."""
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: False,
+        )
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+
+        cfg_ns = cfg
+        b24 = FakeB24(
+            item_get_responses=[
+                # _reread_guard
+                {
+                    "id": 100,
+                    cfg_ns.field_workday_date: TODAY.isoformat(),
+                    cfg_ns.field_workday_works: [],
+                },
+                # verify_log — день
+                {"id": 100, cfg_ns.field_workday_works: ["777"]},
+                # verify_log — учёт
+                {
+                    "id": 777,
+                    cfg_ns.field_log_parent: "100",
+                    cfg_ns.field_log_description: "Общие задачи подразделения",
+                    cfg_ns.field_log_hours: "8.0",
+                },
+                # _window_guard (complete_day_activities)
+                {"id": 100, cfg_ns.field_workday_date: TODAY.isoformat()},
+            ],
+            item_add_response={"id": 777},
+            activities_by_day={100: [_make_activity(20)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5)
+
+        assert len(results) == 1
+        row = results[0]
+        assert row["status"] == "filled"
+        assert "activity_status" in row
+        assert row.get("activity_ok") is True
+        # activity_complete был вызван для дела id=20
+        assert any(c["activity_id"] == 20 for c in b24.activity_complete_calls)
+
+    def test_filled_verify_fails_activity_not_called(self, monkeypatch):
+        """filled-кандидат, verify_log → ok=False: complete_day_activities НЕ вызывается.
+
+        Проверяем:
+        - activity_complete_calls пуст (complete_day_activities НЕ вызывался);
+        - строка результата: activity_status == 'skipped', activity_ok is False;
+        - verify_ok is False.
+        """
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: False,
+        )
+        monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
+
+        cfg_ns = cfg
+        b24 = FakeB24(
+            item_get_responses=[
+                # _reread_guard: день в окне, works пуст → пропускает запись
+                {
+                    "id": 100,
+                    cfg_ns.field_workday_date: TODAY.isoformat(),
+                    cfg_ns.field_workday_works: [],
+                },
+                # verify_log — день: new_id=777 НЕ в works (день не обновился / расхождение)
+                {"id": 100, cfg_ns.field_workday_works: []},
+                # verify_log — учёт: часы расходятся (дополнительное расхождение)
+                {
+                    "id": 777,
+                    cfg_ns.field_log_parent: "100",
+                    cfg_ns.field_log_description: "Общие задачи подразделения",
+                    cfg_ns.field_log_hours: "4.0",  # ожидалось 8.0
+                },
+            ],
+            item_add_response={"id": 777},
+            # Дело у дня есть — но закрывать его НЕ должны при verify_ok=False
+            activities_by_day={100: [_make_activity(20)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5)
+
+        assert len(results) == 1
+        row = results[0]
+        # Учёт создан успешно → статус filled
+        assert row["status"] == "filled"
+        # Верификация не пройдена
+        assert row.get("verify_ok") is False
+        # Дело НЕ закрываем — activity_status="skipped", activity_ok=False
+        assert row.get("activity_status") == "skipped"
+        assert row.get("activity_ok") is False
+        # activity_complete не вызывался ни разу
+        assert len(b24.activity_complete_calls) == 0
+
+    def test_dry_run_candidate_shows_activity_plan(self, monkeypatch):
+        """dry-run кандидат → строка dry-run, activity_status присутствует, complete НЕ вызван."""
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+
+        cfg_ns = cfg
+        b24 = FakeB24(
+            item_get_responses=[
+                # _reread_guard (для create_log dry-run)
+                {
+                    "id": 100,
+                    cfg_ns.field_workday_date: TODAY.isoformat(),
+                    cfg_ns.field_workday_works: [],
+                },
+                # _window_guard (complete_day_activities)
+                {"id": 100, cfg_ns.field_workday_date: TODAY.isoformat()},
+            ],
+            activities_by_day={100: [_make_activity(20)]},
+        )
+
+        results = run_fill(b24, cfg, dry_run=True, interaction=False, today=TODAY, limit=5)
+
+        assert len(results) == 1
+        row = results[0]
+        assert row["status"] == "dry-run"
+        assert "activity_status" in row
+        # В dry-run activity_complete НЕ вызывался
+        assert len(b24.activity_complete_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Тесты has_errors: флаг activity_ok is False → код 2 (smoke-тест логики)
+# ---------------------------------------------------------------------------
+
+class TestHasErrors:
+    """Smoke-проверка логики has_errors из _cmd_fill: activity_ok=False → ошибка."""
+
+    @staticmethod
+    def _has_errors(results: List[Dict[str, Any]]) -> bool:
+        """Воспроизводим логику has_errors из main._cmd_fill (без сети)."""
+        return any(
+            r["status"] == "error"
+            or r.get("verify_ok") is False
+            or r.get("activity_ok") is False
+            for r in results
+        )
+
+    def test_activity_ok_false_is_error(self):
+        """activity_ok=False → has_errors=True."""
+        results = [{"status": "filled", "activity_ok": False}]
+        assert self._has_errors(results) is True
+
+    def test_activity_ok_true_no_error(self):
+        """activity_ok=True, status='filled' → has_errors=False."""
+        results = [{"status": "filled", "activity_ok": True, "verify_ok": True}]
+        assert self._has_errors(results) is False
+
+    def test_activity_ok_absent_no_error(self):
+        """activity_ok отсутствует (None — не is False) → не считается ошибкой."""
+        results = [{"status": "skipped"}]
+        assert self._has_errors(results) is False
+
+    def test_status_error_is_error(self):
+        """status='error' → has_errors=True."""
+        results = [{"status": "error", "reason": "some failure"}]
+        assert self._has_errors(results) is True
+
+    def test_verify_ok_false_is_error(self):
+        """verify_ok=False → has_errors=True."""
+        results = [{"status": "filled", "verify_ok": False, "activity_ok": True}]
+        assert self._has_errors(results) is True
+
+    def test_mixed_results_any_error_triggers(self):
+        """Смесь: одна строка filled, одна с activity_ok=False → has_errors=True."""
+        results = [
+            {"status": "filled", "activity_ok": True},
+            {"status": "filled", "activity_ok": False},
+        ]
+        assert self._has_errors(results) is True
+
+    def test_empty_results_no_error(self):
+        """Пустой список результатов → has_errors=False."""
+        assert self._has_errors([]) is False

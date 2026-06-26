@@ -230,6 +230,164 @@ def _reread_guard(b24: B24, day: WorkdayDay, cfg: Config, today: date) -> Option
     return None
 
 
+# --- Гард окна для «ремонта» закрытия дела (FR-2.1.7) ----------------------------------------
+
+def _window_guard(b24: B24, day: WorkdayDay, cfg: Config) -> Optional[str]:
+    """Лёгкий гард 4-дневного окна перед завершением дела дня (без проверки пустоты works).
+
+    Отличие от `_reread_guard`: НЕ требует пустоты «Работ за день» — завершать дело нужно и
+    у уже заполненных дней («ремонт»). Перечитываем день (id + дата), пересчитываем актуальную
+    дату МСК и проверяем окно. Любая ошибка/отсутствие дня → строка-причина (безопасный отказ).
+
+    Возвращает None, если завершать дела можно; иначе строку-причину пропуска.
+    """
+    select = ["id", cfg.field_workday_date]
+    try:
+        fresh = b24.item_get(cfg.workday_type_id, day.id, select=select)
+    except B24Error as exc:
+        return f"не удалось перечитать день перед завершением дела: {exc}"
+    if not fresh:
+        return "день не найден при перечитывании перед завершением дела"
+
+    effective_today = today_moscow()
+    if not within_edit_window(
+        fresh, cfg.edit_window_days, today=effective_today, date_field=cfg.field_workday_date
+    ):
+        return "дата вне 4-дневного окна (проверка перед завершением дела)"
+
+    return None
+
+
+# --- Завершение CRM-дел дня «Выполнено» (FR-2.1.7) -------------------------------------------
+
+# Поля дела для select crm.activity.list (ВЕРХНИЙ регистр — так отдаёт API).
+_ACTIVITY_SELECT = [
+    "ID", "SUBJECT", "COMPLETED", "PROVIDER_ID",
+    "RESPONSIBLE_ID", "OWNER_ID", "OWNER_TYPE_ID",
+]
+
+
+def _activity_id(item: Dict[str, Any]) -> Optional[int]:
+    """Достать ID дела из словаря crm.activity.list (ключ "ID"/"id"). None — если не разобрать."""
+    raw = item.get("ID") if item.get("ID") not in (None, "") else item.get("id")
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def complete_day_activities(
+    b24: B24,
+    day: WorkdayDay,
+    cfg: Config,
+    *,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Завершить открытые CRM-дела «Заполнить работы по договорам» на дне (кнопка «Выполнено»).
+
+    Алгоритм (FR-2.1.7):
+      1. Гард 4-дневного окна (_window_guard); если вне окна/нет дня → status="skipped".
+      2. crm.activity.list открытых дел дня (PROVIDER_ID=cfg.activity_provider_id, COMPLETED=N).
+         Любая B24Error → status="error".
+      3. Нет открытых дел → status="no-activity" (день уже закрыт / дела нет).
+      4. dry-run → status="dry-run" + список activity_ids (ничего не пишем).
+      5. Боевой режим → crm.activity.update COMPLETED=Y по каждому делу. При любой ошибке —
+         status="error" (с собранными причинами), иначе status="completed".
+
+    Идемпотентность: фильтр COMPLETED=N не возвращает уже закрытые дела, поэтому повторный
+    запуск безопасен. Завершаем ВСЕ найденные дела (на случай дублей).
+
+    Возвращает словарь {status, ...}; в лог — id дня и количество дел (без значений/секретов).
+    """
+    reason = _window_guard(b24, day, cfg)
+    if reason is not None:
+        log.info("День id=%d: завершение дела пропущено — %s.", day.id, reason)
+        return {"status": "skipped", "reason": reason}
+
+    try:
+        open_acts = b24.activity_list(
+            cfg.workday_type_id,
+            day.id,
+            provider_id=cfg.activity_provider_id,
+            only_open=True,
+            select=_ACTIVITY_SELECT,
+        )
+    except B24Error as exc:
+        log.error("День id=%d: ошибка чтения дел (crm.activity.list): %s", day.id, exc)
+        return {"status": "error", "reason": f"не удалось прочитать дела дня: {exc}"}
+
+    if not open_acts:
+        log.info("День id=%d: открытых дел «%s» нет — закрывать нечего.",
+                 day.id, cfg.activity_provider_id)
+        return {"status": "no-activity"}
+
+    activity_ids: List[int] = []
+    for item in open_acts:
+        aid = _activity_id(item)
+        if aid is not None:
+            activity_ids.append(aid)
+
+    if not activity_ids:
+        # Не логируем содержимое дел (значения полей) — только число и набор ключей.
+        log.error(
+            "День id=%d: найдено дел %d, но без корректного ID (ключи: %s).",
+            day.id, len(open_acts), [sorted(it.keys()) for it in open_acts],
+        )
+        return {"status": "error", "reason": "дела найдены, но без корректного ID"}
+
+    if dry_run:
+        log.info(
+            "DRY-RUN: план crm.activity.update COMPLETED=Y для дня id=%d, дел=%d (id %s) — "
+            "запись НЕ выполнена.",
+            day.id, len(activity_ids), activity_ids,
+        )
+        return {"status": "dry-run", "activity_ids": activity_ids}
+
+    # Боевой режим: завершаем все найденные открытые дела.
+    problems: List[str] = []
+    for aid in activity_ids:
+        try:
+            b24.activity_complete(aid, plan_only=False)
+        except B24Error as exc:
+            log.error("День id=%d: ошибка завершения дела id=%d: %s", day.id, aid, exc)
+            problems.append(f"дело id={aid}: {exc}")
+    if problems:
+        return {
+            "status": "error",
+            "reason": "; ".join(problems),
+            "activity_ids": activity_ids,
+        }
+
+    log.info("День id=%d: завершено дел «Выполнено»: %d (id %s).",
+             day.id, len(activity_ids), activity_ids)
+    return {"status": "completed", "activity_ids": activity_ids}
+
+
+def verify_activities_closed(b24: B24, day_id: int, cfg: Config) -> Dict[str, Any]:
+    """Подтвердить, что у дня не осталось открытых дел «Заполнить работы по договорам».
+
+    Перечитывает открытые дела (COMPLETED=N) и возвращает {ok, open_ids, day_id}.
+    ok=True, если открытых дел не осталось. Ошибку чтения трактуем как «не подтверждено».
+    """
+    try:
+        open_acts = b24.activity_list(
+            cfg.workday_type_id,
+            day_id,
+            provider_id=cfg.activity_provider_id,
+            only_open=True,
+            select=_ACTIVITY_SELECT,
+        )
+    except B24Error as exc:
+        log.error("День id=%d: не удалось проверить закрытие дел: %s", day_id, exc)
+        return {"ok": False, "open_ids": [], "day_id": day_id, "reason": str(exc)}
+
+    open_ids = [aid for aid in (_activity_id(it) for it in open_acts) if aid is not None]
+    ok = not open_ids
+    if not ok:
+        log.error("День id=%d: остались открытые дела после завершения: %s", day_id, open_ids)
+    return {"ok": ok, "open_ids": open_ids, "day_id": day_id}
+
+
 # --- Создание учёта (4_03) -------------------------------------------------------------------
 
 def create_log(
@@ -383,11 +541,65 @@ def _result_row(day: WorkdayDay, status: str, **extra: Any) -> Dict[str, Any]:
     return row
 
 
+def _finalize_activity(
+    b24: B24, day: WorkdayDay, cfg: Config, outcome: Dict[str, Any]
+) -> Dict[str, Any]:
+    """По результату complete_day_activities собрать поля строки результата (для сводки/кода).
+
+    Возвращает {activity_status, activity_ids, activity_ok}. activity_ok:
+      True  — закрывать было нечего (no-activity), показан план (dry-run), либо закрыто и
+              подтверждено перечитыванием (completed → verify_activities_closed.ok);
+      False — skipped/error, либо после завершения остались открытые дела (verify не прошёл).
+    """
+    a_status = outcome["status"]
+    a_ids = outcome.get("activity_ids", [])
+    if a_status == "completed":
+        ver = verify_activities_closed(b24, day.id, cfg)
+        return {"activity_status": a_status, "activity_ids": a_ids, "activity_ok": ver["ok"]}
+    if a_status in ("no-activity", "dry-run"):
+        return {"activity_status": a_status, "activity_ids": a_ids, "activity_ok": True}
+    # skipped / error — завершение не выполнено, считаем проблемой для сводки и кода возврата.
+    return {"activity_status": a_status, "activity_ids": a_ids, "activity_ok": False}
+
+
+def _activity_detail(row: Dict[str, Any]) -> str:
+    """Краткое описание состояния дела для строки сводки (или '' если дела не трогали)."""
+    a_status = row.get("activity_status")
+    if not a_status:
+        return ""
+    ids = row.get("activity_ids") or []
+    human = {
+        "completed": "дело закрыто",
+        "no-activity": "дел нет",
+        "dry-run": "план закрытия дела",
+        "skipped": "закрытие пропущено",
+        "error": "ОШИБКА закрытия дела",
+    }.get(a_status, a_status)
+    suffix = f" (id {ids})" if ids else ""
+    text = f"{human}{suffix}"
+    if row.get("activity_ok") is False:
+        text += "; ДЕЛО НЕ ЗАКРЫТО"
+    return text
+
+
+# Статус строки результата «ремонта» по статусу complete_day_activities.
+_REPAIR_STATUS = {
+    "completed": "repaired",
+    "no-activity": "already-closed",
+    "dry-run": "dry-run",
+    "skipped": "skipped",
+    "error": "error",
+}
+
+
 def _print_summary(results: List[Dict[str, Any]], *, dry_run: bool) -> None:
-    """Напечатать сводную таблицу итогов и счётчики по кандидатам."""
+    """Напечатать сводную таблицу итогов и счётчики (создание + отдельный блок «ремонта»)."""
     counts: Dict[str, int] = {}
+    create_rows = [r for r in results if not r.get("repair")]
+    repair_rows = [r for r in results if r.get("repair")]
+
     log.info("=== Сводка fill (%s) ===", "DRY-RUN" if dry_run else "БОЕВОЙ РЕЖИМ")
-    for row in results:
+    for row in create_rows:
         status = row["status"]
         counts[status] = counts.get(status, 0) + 1
         detail = ""
@@ -397,6 +609,9 @@ def _print_summary(results: List[Dict[str, Any]], *, dry_run: bool) -> None:
             detail = str(row["reason"])
         if row.get("verify_ok") is False:
             detail = (detail + "; " if detail else "") + "ВЕРИФИКАЦИЯ НЕ ПРОЙДЕНА"
+        act = _activity_detail(row)
+        if act:
+            detail = (detail + "; " if detail else "") + act
         log.info(
             "  день id=%s | %s | %-8s | %s",
             row["day_id"],
@@ -404,8 +619,26 @@ def _print_summary(results: List[Dict[str, Any]], *, dry_run: bool) -> None:
             status,
             detail or "—",
         )
+
+    if repair_rows:
+        log.info("--- «Ремонт» закрытия дел (учёт есть, дело могло остаться открытым) ---")
+        for row in repair_rows:
+            status = row["status"]
+            counts[status] = counts.get(status, 0) + 1
+            detail = str(row.get("reason") or "")
+            act = _activity_detail(row)
+            if act:
+                detail = (detail + "; " if detail else "") + act
+            log.info(
+                "  день id=%s | %s | %-13s | %s",
+                row["day_id"],
+                row["date"] or "—",
+                status,
+                detail or "—",
+            )
+
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "нет кандидатов"
-    log.info("Итого по кандидатам: %s.", summary)
+    log.info("Итого: %s.", summary)
 
 
 def run_fill(
@@ -421,8 +654,14 @@ def run_fill(
 
     Читаем дни шире окна (today − (edit_window_days + 3) … today), чтобы select_candidates
     корректно взял топ-`limit` по id desc, затем отбираем кандидатов (окно + пустота).
-    Для каждого кандидата: collect_values → create_log → (filled и не dry_run) verify_log.
-    Сигнал ABORT прерывает цикл; необработанные кандидаты помечаются «aborted».
+    Для каждого кандидата: collect_values → create_log → verify_log → закрытие дела
+    «Выполнено» (complete_day_activities, FR-2.1.7). Сигнал ABORT прерывает цикл;
+    необработанные кандидаты помечаются «aborted».
+
+    «Ремонт» (FR-2.1.7): после цикла создания — отдельный проход по дням, у которых учёт
+    уже есть (works непуст), но дело «Заполнить работы по договорам» могло остаться открытым
+    (день не ушёл из «Запланированные»). Таким дням учёт не создаём, только закрываем дело.
+    Проход самоидемпотентен (фильтр COMPLETED=N); журнал для него не задействуем.
     Возвращает список результатов; в конце печатает сводную таблицу.
 
     Идемпотентность (5_01): в боевом режиме перед обработкой кандидата сверяемся с
@@ -432,7 +671,7 @@ def run_fill(
     """
     from datetime import timedelta
 
-    from .workday import read_days, select_candidates
+    from .workday import read_days, select_candidates, select_repair_days
 
     now_ts = int(time.time())
     # Журнал читаем только в боевом режиме (в dry-run он не задействован).
@@ -441,12 +680,11 @@ def run_fill(
     date_from = today - timedelta(days=cfg.edit_window_days + 3)
     days = read_days(b24, cfg, date_from, today)
     candidates = select_candidates(days, cfg, today, limit=limit)
+    repair_days = select_repair_days(days, cfg, today, limit=limit)
 
     results: List[Dict[str, Any]] = []
     if not candidates:
-        log.info("Кандидатов на заполнение нет (после отбора в окне 4 дней).")
-        _print_summary(results, dry_run=dry_run)
-        return results
+        log.info("Кандидатов на создание учёта нет (после отбора в окне 4 дней).")
 
     applied_to_all: Optional[Values] = None
     aborted = False
@@ -516,6 +754,22 @@ def run_fill(
             verification = verify_log(
                 b24, day.id, created["new_id"], outcome.description, outcome.hours, cfg
             )
+            if verification["ok"]:
+                # FR-2.1.7: учёт создан и подтверждён — закрыть дело дня «Выполнено».
+                act_outcome = complete_day_activities(b24, day, cfg, dry_run=dry_run)
+                act_fields = _finalize_activity(b24, day, cfg, act_outcome)
+            else:
+                # Учёт создан, но верификация не прошла — дело НЕ закрываем: день остаётся
+                # в «Запланированные» как видимый сигнал проблемы (не маскируем расхождение).
+                log.warning(
+                    "День id=%d: верификация учёта не пройдена — дело «Выполнено» НЕ закрываем.",
+                    day.id,
+                )
+                act_fields = {
+                    "activity_status": "skipped",
+                    "activity_ids": [],
+                    "activity_ok": False,
+                }
             results.append(
                 _result_row(
                     day,
@@ -523,14 +777,41 @@ def run_fill(
                     new_id=created["new_id"],
                     verify_ok=verification["ok"],
                     reason=("; ".join(verification["problems"]) if verification["problems"] else ""),
+                    **act_fields,
                 )
             )
         elif status == "dry-run":
-            results.append(_result_row(day, status, reason="план показан, запись не выполнена"))
+            # Предпросмотр включает и закрытие дела «Выполнено» (read-only в dry-run).
+            act_outcome = complete_day_activities(b24, day, cfg, dry_run=dry_run)
+            act_fields = _finalize_activity(b24, day, cfg, act_outcome)
+            results.append(
+                _result_row(
+                    day, status, reason="план показан, запись не выполнена", **act_fields
+                )
+            )
         elif status == "skipped":
             results.append(_result_row(day, status, reason=created.get("reason", "")))
         else:  # error
             results.append(_result_row(day, status, reason=created.get("reason", "")))
+
+    # --- «Ремонт» закрытия дел (FR-2.1.7) ---------------------------------------------------
+    # Дни с уже созданным учётом (works непуст), но возможно открытым делом «Заполнить работы
+    # по договорам» — день не ушёл из «Запланированные». Учёт не создаём, только закрываем дело.
+    # При aborted весь пакет прерван пользователем — «ремонт» тоже не выполняем.
+    if not aborted:
+        for day in repair_days:
+            act_outcome = complete_day_activities(b24, day, cfg, dry_run=dry_run)
+            act_fields = _finalize_activity(b24, day, cfg, act_outcome)
+            row_status = _REPAIR_STATUS.get(act_outcome["status"], act_outcome["status"])
+            results.append(
+                _result_row(
+                    day,
+                    row_status,
+                    repair=True,
+                    reason=act_outcome.get("reason", ""),
+                    **act_fields,
+                )
+            )
 
     _print_summary(results, dry_run=dry_run)
     return results

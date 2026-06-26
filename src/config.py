@@ -68,6 +68,9 @@ class Config:
     runtime: Dict[str, Any] = field(default_factory=dict)
     contract_general_tasks: str = ""
     edit_window_days: int = 4
+    # Провайдер CRM-дела «Заполнить работы по договорам» (завершение = «Выполнено», FR-2.1.7).
+    # Owner type дел = workday_type_id (1208); отдельный конфиг не заводим.
+    activity_provider_id: str = "CRM_TODO"
 
     # --- Удобные геттеры метамодели (читаемость в остальном коде) ---
     @property
@@ -244,4 +247,5 @@ def load_config(
         runtime=data.get("runtime") or {},
         contract_general_tasks=str(data.get("contract_general_tasks", "")),
         edit_window_days=int(data.get("edit_window_days", 4)),
+        activity_provider_id=str(data.get("activity_provider_id", "CRM_TODO")),
     )

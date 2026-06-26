@@ -25,12 +25,16 @@
 
 ## Фаза 4 — Создание учёта (FR-2.1.6–2.1.11) [DONE]
 - `phase_4_00_overview.md`
-- `phase_4_01_done_button_investigation.md` — наблюдение «Выполнено» (read-only) [DONE]
+- `phase_4_01_done_button_investigation.md` — наблюдение «Выполнено» (read-only) [DONE, вывод исправлен 2026-06-26]
 - `phase_4_02_values_prompt.md` — дефолт + подтверждение [DONE]
 - `phase_4_03_create_log.md` — crm.item.add 1218 (plan→execute) [DONE]
 - `phase_4_04_verify.md` — верификация перечитыванием [DONE]
+- `phase_4_05_done_button_fix.md` — FR-2.1.7 завершение CRM-дела «Выполнено» [DONE]
 - Отчёт: `../tasks_done/phase_4_done.md` (2026-06-26). Боевой тест на одном дне выполнен с явного
   разрешения заказчика: учёт 1218 id=163736 под днём id=271557, верификация OK.
+- Отчёт (доработка): `../tasks_done/phase_4_05_done_button_fix.md` (2026-06-26). Закрытие CRM-дела
+  «Выполнено» (crm.activity.update COMPLETED=Y); боевой прогон: дело id=169987 на дне id=271557 —
+  status repaired, exit 0. 261 passed.
 
 ## Фаза 5 — Надёжность и эксплуатация [DONE]
 - `phase_5_00_overview.md`
@@ -44,5 +48,5 @@
 
 ## Отложенные
 - `phase_delayed_1_01_task_elapseditem.md` — альтернативный механизм через task.elapseditem
-- `phase_delayed_1_02_browser_fallback.md` — браузерный fallback (если REST не покрывает «Выполнено»)
+- `phase_delayed_1_02_browser_fallback.md` — браузерный fallback (REST полностью покрывает «Выполнено» через crm.activity.update; fallback не нужен)
 - `phase_delayed_1_03_scheduler.md` — автозапуск по расписанию

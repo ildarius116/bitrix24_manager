@@ -77,7 +77,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "ЯВНЫЙ гейт боевой записи в прод. Без него (или вместе с --dry-run) — только dry-run. "
-            "Боевой режим (crm.item.add 1218) — лишь при --confirm-write БЕЗ --dry-run."
+            "Боевой режим (crm.item.add 1218 + закрытие дела «Выполнено» crm.activity.update, "
+            "FR-2.1.7) — лишь при --confirm-write БЕЗ --dry-run."
         ),
     )
 
@@ -245,8 +246,9 @@ def _cmd_fill(config: Config, args: argparse.Namespace) -> int:
         )
     else:
         log.warning(
-            "БОЕВОЙ РЕЖИМ: будет выполнена запись в прод (crm.item.add 1218). "
-            "Окно 4 дней и пустота перепроверяются перед каждой записью."
+            "БОЕВОЙ РЕЖИМ: будет выполнена запись в прод (crm.item.add 1218 + закрытие дела "
+            "«Выполнено» crm.activity.update, FR-2.1.7). Окно 4 дней и пустота перепроверяются "
+            "перед каждой записью; «ремонт» закрывает дела и у уже заполненных дней."
         )
 
     b24 = B24(config)
@@ -265,7 +267,12 @@ def _cmd_fill(config: Config, args: argparse.Namespace) -> int:
         log.warning("fill прерван пользователем (Ctrl+C / EOF). Запись не выполнена/прервана.")
         return 2
 
-    has_errors = any(r["status"] == "error" or r.get("verify_ok") is False for r in results)
+    has_errors = any(
+        r["status"] == "error"
+        or r.get("verify_ok") is False
+        or r.get("activity_ok") is False
+        for r in results
+    )
     return 2 if has_errors else 0
 
 

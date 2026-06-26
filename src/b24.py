@@ -366,6 +366,68 @@ class B24:
             return result.get("item") if isinstance(result.get("item"), dict) else result
         return {"result": result}
 
+    # --- CRM-дела (To-Do): завершение «Выполнено» (FR-2.1.7) ---
+    def activity_list(
+        self,
+        owner_type_id: int,
+        owner_id: int,
+        *,
+        provider_id: Optional[str] = None,
+        only_open: bool = True,
+        select: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """crm.activity.list по карточке-владельцу (день 1208) — список дел.
+
+        Фильтр: OWNER_TYPE_ID/OWNER_ID (привязка дел смарт-процесса), опционально
+        PROVIDER_ID (напр. "CRM_TODO") и COMPLETED:"N" (только открытые — делает
+        операцию завершения идемпотентной).
+
+        ВНИМАНИЕ: result у crm.activity.list — это ПЛОСКИЙ СПИСОК словарей (не {items:[...]}),
+        а поля дел — в ВЕРХНЕМ регистре (ID, SUBJECT, COMPLETED, PROVIDER_ID...).
+        Дел на дне обычно одно — пагинацию не делаем. Возвращает список (или []).
+        """
+        flt: Dict[str, Any] = {"OWNER_TYPE_ID": owner_type_id, "OWNER_ID": owner_id}
+        if provider_id:
+            flt["PROVIDER_ID"] = provider_id
+        if only_open:
+            flt["COMPLETED"] = "N"
+        params: Dict[str, Any] = {"filter": flt}
+        if select:
+            params["select"] = select
+        response = self.call("crm.activity.list", params)
+        result = response.get("result")
+        if isinstance(result, list):
+            return result
+        # Дискавери доказал плоский список; иную форму не «глотаем» молча, чтобы открытое
+        # дело не осталось незакрытым без сигнала.
+        log.warning(
+            "crm.activity.list вернул result неожиданной формы (%s) для owner %s/%s — "
+            "трактуем как «дел нет».",
+            type(result).__name__, owner_type_id, owner_id,
+        )
+        return []
+
+    def activity_complete(
+        self, activity_id: int, *, plan_only: bool = False
+    ) -> Dict[str, Any]:
+        """Завершить CRM-дело: crm.activity.update COMPLETED=Y (кнопка «Выполнено», FR-2.1.7).
+
+        ВНИМАНИЕ (CLAUDE.md §5): реальная запись в прод — только по явному разрешению.
+        Поддержка plan→execute: при plan_only=True ничего не пишет, возвращает план-описание.
+        """
+        params = {"id": activity_id, "fields": {"COMPLETED": "Y"}}
+        if plan_only:
+            return {
+                "plan_only": True,
+                "method": "crm.activity.update",
+                "params": params,
+                "note": (
+                    "Запись НЕ выполнена (plan_only). Для исполнения требуется явное "
+                    "разрешение пользователя (политика записи в прод)."
+                ),
+            }
+        return self.call("crm.activity.update", params)
+
     def resolve_users(self, ids: List[int]) -> Dict[int, str]:
         """Резолвинг user id → «Фамилия Имя Отчество» через read-only user.get.
 

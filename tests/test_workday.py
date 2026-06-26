@@ -13,7 +13,7 @@ import types
 from datetime import date
 
 from src.export_excel import NO_DESCRIPTION, _group_rows
-from src.workday import WorkdayDay, WorkLog, data_time_range, select_candidates
+from src.workday import WorkdayDay, WorkLog, data_time_range, select_candidates, select_repair_days
 
 # Фиксированная «сегодня» для детерминированных тестов select_candidates.
 TODAY = date(2026, 6, 25)
@@ -263,3 +263,86 @@ def test_select_candidates_all_dates_in_window_all_pass():
     ]
     result = select_candidates(days, _cfg, TODAY)
     assert len(result) == len(days)  # все 5 проходят
+
+
+# ---------------------------------------------------------------------------
+# select_repair_days (FR-2.1.7): зеркало select_candidates, но берёт заполненные дни
+# today=2026-06-25, edit_window_days=4 → earliest=2026-06-21
+# ---------------------------------------------------------------------------
+
+
+def test_select_repair_days_returns_filled_day_in_window():
+    """Заполненный день в окне (works непуст) → попадает в ремонт."""
+    day = _bare_day(TODAY, day_id=1, works_ids=[100])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert result == [day]
+
+
+def test_select_repair_days_empty_works_excluded():
+    """Пустые works_ids → не ремонт (эти дни берёт select_candidates)."""
+    day = _bare_day(TODAY, day_id=2, works_ids=[])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_repair_days_boundary_today_minus_4_included():
+    """Граница today−4 (2026-06-21) ПРОХОДИТ в ремонт (включительно)."""
+    from datetime import timedelta
+    boundary = TODAY - timedelta(days=_cfg.edit_window_days)  # 2026-06-21
+    day = _bare_day(boundary, day_id=3, works_ids=[99])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert len(result) == 1
+    assert result[0].id == 3
+
+
+def test_select_repair_days_today_minus_5_excluded():
+    """today−5 (2026-06-20) НЕ ПРОХОДИТ: вне 4-дневного окна."""
+    from datetime import timedelta
+    too_old = TODAY - timedelta(days=_cfg.edit_window_days + 1)  # 2026-06-20
+    day = _bare_day(too_old, day_id=4, works_ids=[99])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_repair_days_future_date_excluded():
+    """Будущая дата (> today) → исключается (верхняя граница = today)."""
+    from datetime import timedelta
+    future = TODAY + timedelta(days=1)
+    day = _bare_day(future, day_id=5, works_ids=[99])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_repair_days_no_date_excluded():
+    """День без даты (date=None) → исключается."""
+    day = _bare_day(None, day_id=6, works_ids=[99])
+    result = select_repair_days([day], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_repair_days_limit_respected():
+    """limit соблюдается: из 7 подходящих дней берутся только первые limit."""
+    days = [_bare_day(TODAY, day_id=200 + i, works_ids=[200 + i]) for i in range(7)]
+    result = select_repair_days(days, _cfg, TODAY, limit=3)
+    assert len(result) == 3
+    assert [d.id for d in result] == [200, 201, 202]
+
+
+def test_select_repair_days_empty_input():
+    """Пустой список дней → пустой результат без исключений."""
+    result = select_repair_days([], _cfg, TODAY)
+    assert result == []
+
+
+def test_select_repair_days_mixed_days():
+    """Комбинированный сценарий: только заполненные + в окне попадают в ремонт."""
+    from datetime import timedelta
+    days = [
+        _bare_day(TODAY, day_id=1, works_ids=[]),           # пустой → нет
+        _bare_day(TODAY, day_id=2, works_ids=[10]),          # заполнен, в окне → ДА
+        _bare_day(None, day_id=3, works_ids=[11]),           # нет даты → нет
+        _bare_day(TODAY - timedelta(days=_cfg.edit_window_days + 1), day_id=4, works_ids=[12]),  # вне окна → нет
+        _bare_day(TODAY, day_id=5, works_ids=[13]),          # заполнен, в окне → ДА
+    ]
+    result = select_repair_days(days, _cfg, TODAY)
+    assert [d.id for d in result] == [2, 5]

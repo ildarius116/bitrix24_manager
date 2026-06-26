@@ -379,3 +379,52 @@ def select_candidates(
         len(candidates),
     )
     return candidates
+
+
+def select_repair_days(
+    days: List[WorkdayDay],
+    cfg: Config,
+    today: date,
+    *,
+    limit: int = 5,
+) -> List[WorkdayDay]:
+    """Отобрать дни для «ремонта» закрытия дела (FR-2.1.7): учёт ЕСТЬ, но день мог не закрыться.
+
+    Зеркало select_candidates по первым `limit` дням (топ id desc), с теми же фильтрами
+    «есть дата» и «в окне 4 дней», НО с обратным условием по работам: берём дни, у которых
+    works_ids НЕ пуст (именно их select_candidates отбрасывает шагом «уже заполнено»).
+
+    Таким дням учёт 1218 создавать НЕ нужно — но открытое CRM-дело «Заполнить работы по
+    договорам» на карточке могло остаться (как у наблюдённого дня 271557). «Ремонт»-проход
+    в run_fill завершает такие дела (crm.activity.update). Сам отбор — без сети.
+
+    Возвращает список WorkdayDay (может быть пустым).
+    """
+    earliest: date = today - timedelta(days=cfg.edit_window_days)
+    repair: List[WorkdayDay] = []
+
+    for day in days[:limit]:
+        if day.date is None:
+            continue
+        if not (earliest <= day.date <= today):
+            continue
+        # Только уже заполненные дни (works_ids непуст) — те, кого создание учёта пропускает.
+        if not day.works_ids:
+            continue
+        log.info(
+            "День id=%d отобран для «ремонта» закрытия дела (дата %s, учётов %d).",
+            day.id,
+            day.date.isoformat(),
+            len(day.works_ids),
+        )
+        repair.append(day)
+
+    log.info(
+        "Отбор дней для «ремонта» завершён: рассмотрено %d из %d дней (limit=%d), "
+        "отобрано: %d.",
+        min(limit, len(days)),
+        len(days),
+        limit,
+        len(repair),
+    )
+    return repair
