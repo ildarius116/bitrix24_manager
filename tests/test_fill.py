@@ -1,4 +1,4 @@
-"""Юнит-тесты write-пайплайна src/fill.py (Фаза 4).
+"""Юнит-тесты write-пайплайна src/fill.py (Фазы 4 и 5).
 
 Все тесты БЕЗ сети: B24 и input полностью замоканы.
 Фиксированная «сегодня» = 2026-06-25.
@@ -11,6 +11,7 @@
 - create_log (dry_run=True)  — plan_only вызов, боевой add НЕ зовётся
 - create_log (dry_run=False) — боевой add, статусы filled / error
 - verify_log                 — верификация привязки и полей по двум item_get
+- run_fill + журнал (5_01)   — пропуск по журналу; mark_processed после filled; dry-run без журнала
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from src.fill import (
     build_payload,
     collect_values,
     create_log,
+    run_fill,
     verify_log,
 )
 from src.workday import WorkdayDay
@@ -907,3 +909,237 @@ class TestSentinels:
     def test_skip_and_abort_are_distinct(self):
         """SKIP и ABORT — разные объекты."""
         assert SKIP is not ABORT
+
+
+# ---------------------------------------------------------------------------
+# Тесты run_fill + журнал (Фаза 5_01)
+# ---------------------------------------------------------------------------
+
+class TestRunFillJournal:
+    """Интеграция run_fill с журналом идемпотентности (phase_5_01).
+
+    read_days / select_candidates мокаются через monkeypatch src.workday.*.
+    load_journal / is_processed / mark_processed мокаются через src.fill.*.
+    Журнал направляется в tmp_path — реальный .runtime не трогается.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        """Зафиксировать today_moscow = 2026-06-25 во всех тестах класса."""
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
+
+    def _guard_passes_item(self, cfg) -> Dict[str, Any]:
+        """Ответ item_get, при котором _reread_guard пропускает запись."""
+        return {
+            "id": 100,
+            cfg.field_workday_date: TODAY.isoformat(),
+            cfg.field_workday_works: [],
+        }
+
+    def _setup_cfg(self) -> types.SimpleNamespace:
+        """Стаб Config с journal_ttl_sec."""
+        cfg = _make_cfg()
+        cfg.journal_ttl_sec = 604800  # 7 дней
+        return cfg
+
+    # -------------------------------------------------------------------
+    # Тест 1: день в журнале (TTL валиден) → пропуск без item_add
+    # -------------------------------------------------------------------
+
+    def test_journal_hit_skips_day_no_item_add(self, monkeypatch):
+        """Если день в журнале в пределах TTL → статус 'skipped', item_add не зовётся."""
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        # Мокаем read_days и select_candidates: один подходящий день
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr(
+            "src.workday.select_candidates",
+            lambda days, cfg, today, limit=5: days,
+        )
+
+        # Мокаем load_journal: возвращает запись по дню 100
+        monkeypatch.setattr(
+            "src.fill.load_journal",
+            lambda path=None: {"100": {"ts": 1_000_000, "log_id": 99}},
+        )
+        # Мокаем is_processed: день считается обработанным
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: True,
+        )
+        # Шпион mark_processed
+        mark_calls: List[Any] = []
+        monkeypatch.setattr(
+            "src.fill.mark_processed",
+            lambda *a, **kw: mark_calls.append((a, kw)),
+        )
+
+        b24 = FakeB24()
+        results = run_fill(
+            b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5
+        )
+
+        assert len(results) == 1
+        assert results[0]["status"] == "skipped"
+        assert "журнал" in results[0].get("reason", "").lower() or "ttl" in results[0].get("reason", "").lower()
+        # item_add не вызывался
+        assert len(b24.item_add_calls) == 0
+        # mark_processed тоже не вызывался
+        assert len(mark_calls) == 0
+
+    # -------------------------------------------------------------------
+    # Тест 2: после успешной записи (filled) вызывается mark_processed
+    # -------------------------------------------------------------------
+
+    def test_mark_processed_called_after_filled(self, monkeypatch):
+        """После успешного create_log (filled) mark_processed вызывается с day_id и new_id."""
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr(
+            "src.workday.select_candidates",
+            lambda days, cfg, today, limit=5: days,
+        )
+
+        # Журнал пуст → день НЕ пропускается по журналу
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: False,
+        )
+
+        # Шпион mark_processed: захватываем аргументы
+        mark_calls: List[Any] = []
+        monkeypatch.setattr(
+            "src.fill.mark_processed",
+            lambda path, day_id, day_date, log_id, now_ts: mark_calls.append(
+                {"path": path, "day_id": day_id, "day_date": day_date, "log_id": log_id}
+            ),
+        )
+
+        # item_get (гард) возвращает: день в окне, пустой works
+        # item_add (боевое) возвращает новый id=777
+        b24 = FakeB24(
+            item_get_responses=[self._guard_passes_item(cfg)],
+            item_add_response={"id": 777},
+        )
+        # verify_log тоже делает item_get (день + учёт); добавляем ответы
+        b24._get_queue.extend([
+            # 2) день для verify_log
+            {
+                "id": 100,
+                cfg.field_workday_works: ["777"],
+            },
+            # 3) учёт для verify_log
+            {
+                "id": 777,
+                cfg.field_log_parent: "100",
+                cfg.field_log_description: "Общие задачи подразделения",
+                cfg.field_log_hours: "8.0",
+            },
+        ])
+
+        results = run_fill(
+            b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5
+        )
+
+        # Должен быть ровно один filled
+        assert len(results) == 1
+        assert results[0]["status"] == "filled"
+        assert results[0]["new_id"] == 777
+
+        # mark_processed вызван один раз с правильными аргументами
+        assert len(mark_calls) == 1
+        call = mark_calls[0]
+        assert call["day_id"] == 100
+        assert call["log_id"] == 777
+
+    # -------------------------------------------------------------------
+    # Тест 3: dry_run=True → журнал не читается и не пишется
+    # -------------------------------------------------------------------
+
+    def test_dry_run_does_not_use_journal(self, monkeypatch):
+        """В dry_run=True load_journal, is_processed и mark_processed не вызываются."""
+        cfg = self._setup_cfg()
+        day = _make_day(day_id=100, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr(
+            "src.workday.select_candidates",
+            lambda days, cfg, today, limit=5: days,
+        )
+
+        # Шпионы: фиксируем вызовы журнальных функций
+        load_calls: List[Any] = []
+        is_proc_calls: List[Any] = []
+        mark_calls: List[Any] = []
+
+        monkeypatch.setattr(
+            "src.fill.load_journal",
+            lambda path=None: (load_calls.append(path) or {}),
+        )
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: (is_proc_calls.append(day_id) or False),
+        )
+        monkeypatch.setattr(
+            "src.fill.mark_processed",
+            lambda *a, **kw: mark_calls.append((a, kw)),
+        )
+
+        # item_get ответ для _reread_guard (dry_run вызывает гард тоже)
+        b24 = FakeB24(
+            item_get_responses=[self._guard_passes_item(cfg)],
+        )
+
+        results = run_fill(
+            b24, cfg, dry_run=True, interaction=False, today=TODAY, limit=5
+        )
+
+        # В dry-run должен быть статус "dry-run", а не "filled"
+        assert len(results) == 1
+        assert results[0]["status"] == "dry-run"
+
+        # load_journal НЕ вызывался (в dry_run journal = {})
+        assert len(load_calls) == 0, "load_journal не должна вызываться в dry_run"
+        # is_processed НЕ вызывался
+        assert len(is_proc_calls) == 0, "is_processed не должна вызываться в dry_run"
+        # mark_processed НЕ вызывался (статус не 'filled')
+        assert len(mark_calls) == 0, "mark_processed не должна вызываться в dry_run"
+
+    # -------------------------------------------------------------------
+    # Тест 4: пустые кандидаты → журнал не задействован
+    # -------------------------------------------------------------------
+
+    def test_no_candidates_journal_not_called(self, monkeypatch):
+        """Если кандидатов нет — is_processed и mark_processed не вызываются."""
+        cfg = self._setup_cfg()
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [])
+        monkeypatch.setattr(
+            "src.workday.select_candidates",
+            lambda days, cfg, today, limit=5: [],
+        )
+
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        is_proc_calls: List[Any] = []
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: (is_proc_calls.append(day_id) or False),
+        )
+        mark_calls: List[Any] = []
+        monkeypatch.setattr(
+            "src.fill.mark_processed",
+            lambda *a, **kw: mark_calls.append((a, kw)),
+        )
+
+        b24 = FakeB24()
+        results = run_fill(
+            b24, cfg, dry_run=False, interaction=False, today=TODAY, limit=5
+        )
+
+        assert results == []
+        assert len(is_proc_calls) == 0
+        assert len(mark_calls) == 0

@@ -32,12 +32,14 @@
 - Отчёт: `../tasks_done/phase_4_done.md` (2026-06-26). Боевой тест на одном дне выполнен с явного
   разрешения заказчика: учёт 1218 id=163736 под днём id=271557, верификация OK.
 
-## Фаза 5 — Надёжность и эксплуатация
+## Фаза 5 — Надёжность и эксплуатация [DONE]
 - `phase_5_00_overview.md`
 - `phase_5_01_idempotency.md`
 - `phase_5_02_dry_run.md`
 - `phase_5_03_logging_audit.md`
 - `phase_5_04_tests.md`
+- Отчёт: `../tasks_done/phase_5_done.md` (2026-06-26). 218 passed (+94 новых тестов).
+  Журнал идемпотентности `.runtime/processed.json`, аудит REST `.runtime/bitrix24_audit.jsonl`.
 
 ## Отложенные
 - `phase_delayed_1_01_task_elapseditem.md` — альтернативный механизм через task.elapseditem

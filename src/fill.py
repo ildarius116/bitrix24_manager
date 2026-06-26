@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Union
@@ -25,6 +26,7 @@ from typing import Any, Dict, List, Optional, Union
 from .b24 import B24, B24Error
 from .config import Config
 from .dates import today_moscow, within_edit_window
+from .journal import DEFAULT_JOURNAL_PATH, is_processed, load_journal, mark_processed
 from .workday import WorkdayDay, _id_list
 
 log = logging.getLogger("workday")
@@ -422,10 +424,19 @@ def run_fill(
     Для каждого кандидата: collect_values → create_log → (filled и не dry_run) verify_log.
     Сигнал ABORT прерывает цикл; необработанные кандидаты помечаются «aborted».
     Возвращает список результатов; в конце печатает сводную таблицу.
+
+    Идемпотентность (5_01): в боевом режиме перед обработкой кандидата сверяемся с
+    локальным журналом (.runtime/processed.json) — день, обработанный в пределах TTL,
+    пропускаем без REST-перечитки. В dry-run журнал НЕ читаем и НЕ пишем, чтобы режим
+    оставался чистым предпросмотром. `now_ts` берётся один раз и прокидывается в helpers.
     """
     from datetime import timedelta
 
     from .workday import read_days, select_candidates
+
+    now_ts = int(time.time())
+    # Журнал читаем только в боевом режиме (в dry-run он не задействован).
+    journal = load_journal() if not dry_run else {}
 
     date_from = today - timedelta(days=cfg.edit_window_days + 3)
     days = read_days(b24, cfg, date_from, today)
@@ -443,6 +454,16 @@ def run_fill(
     for idx, day in enumerate(candidates):
         if aborted:
             results.append(_result_row(day, "aborted", reason="прервано пользователем (abort)"))
+            continue
+
+        # Идемпотентность (5_01): в боевом режиме пропускаем дни, уже отмеченные в
+        # журнале в пределах TTL (экономим лишнюю REST-перечитку; гард остаётся главным).
+        if not dry_run and is_processed(
+            journal, day.id, ttl_sec=cfg.journal_ttl_sec, now_ts=now_ts
+        ):
+            reason = "уже обработан ранее (журнал, в пределах TTL)"
+            log.info("День id=%d: пропуск — %s.", day.id, reason)
+            results.append(_result_row(day, "skipped", reason=reason))
             continue
 
         outcome = collect_values(
@@ -475,6 +496,23 @@ def run_fill(
         status = created["status"]
 
         if status == "filled":
+            # Боевая запись прошла — фиксируем день в журнале (идемпотентность, 5_01).
+            # В dry-run сюда не попадаем (там статус "dry-run"), журнал не трогаем.
+            try:
+                mark_processed(
+                    DEFAULT_JOURNAL_PATH,
+                    day.id,
+                    day.date.isoformat() if day.date else "",
+                    created["new_id"],
+                    now_ts=now_ts,
+                )
+            except Exception as _journal_exc:
+                log.warning(
+                    "День id=%d: не удалось записать журнал обработки (%s); "
+                    "запись в Bitrix уже создана, гард защитит от дубля.",
+                    day.id,
+                    _journal_exc,
+                )
             verification = verify_log(
                 b24, day.id, created["new_id"], outcome.description, outcome.hours, cfg
             )

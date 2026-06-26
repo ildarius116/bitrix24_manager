@@ -33,3 +33,4 @@ export:
 
 runtime:
   interaction: true               # true = спрашивать подтверждение; false = автозапуск
+  journal_ttl_days: 7             # TTL журнала обработанных дней (.runtime/processed.json), дни

@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+log = logging.getLogger("workday")
 
 import yaml
 
@@ -121,6 +124,21 @@ class Config:
     def contract_tech_id(self) -> str:
         """[тех] строковый ID договора (defaults.contract_tech_id, напр. "2")."""
         return str(self.defaults.get("contract_tech_id", ""))
+
+    @property
+    def journal_ttl_sec(self) -> int:
+        """TTL локального журнала обработанных дней в секундах.
+
+        Читается из runtime.journal_ttl_days (дни, дефолт 7) и переводится в секунды.
+        """
+        try:
+            return int(self.runtime.get("journal_ttl_days", 7)) * 86400
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "Некорректное значение runtime.journal_ttl_days (%s) — откат к 7 дням.",
+                exc,
+            )
+            return 7 * 86400
 
 
 def _require_env(name: str, *, secret: bool = False) -> str:

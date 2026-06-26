@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -43,6 +45,17 @@ except ImportError as exc:  # pragma: no cover
         f"Не удалось импортировать REST-клиент скилла из {_SKILL_SCRIPTS}. "
         "Проверьте наличие .claude/skills/bitrix24-agent/scripts/bitrix24_client.py."
     ) from exc
+
+# Аудит REST-вызовов (5_03): переиспользуем хелперы клиента. Если их нет в текущей
+# версии скилла — аудит просто отключается (None), основной поток не падает.
+try:
+    from bitrix24_client import (  # type: ignore[import-not-found]
+        get_audit_file_path,
+        write_audit_row,
+    )
+except ImportError:  # pragma: no cover
+    get_audit_file_path = None  # type: ignore[assignment]
+    write_audit_row = None  # type: ignore[assignment]
 
 
 # Подсказки по типичным ошибкам доступа (PRD §2.6, phase_1_03).
@@ -109,6 +122,15 @@ class B24:
 
     def __init__(self, config: Config, *, client: Optional[Bitrix24Client] = None) -> None:
         self.config = config
+        # Целевой файл аудита REST (5_03). По умолчанию — .runtime/bitrix24_audit.jsonl
+        # (через B24_AUDIT_FILE можно переопределить). Любая ошибка определения пути не
+        # должна мешать работе — тогда аудит просто отключается.
+        self._audit_file: Optional[Path] = None
+        if get_audit_file_path is not None:
+            try:
+                self._audit_file = get_audit_file_path(config.env.audit_file)
+            except Exception:  # pragma: no cover - аудит не критичен
+                self._audit_file = None
         if client is not None:
             self.client = client
             return
@@ -124,13 +146,69 @@ class B24:
             rate_limiter=build_rate_limiter_from_env(),
         )
 
+    # --- Аудит REST (5_03) ---
+    def _write_audit(
+        self,
+        method: str,
+        params: Any,
+        started: float,
+        request_id: str,
+        *,
+        status: str,
+        error_code: str = "",
+        error_message: str = "",
+    ) -> None:
+        """Записать одну строку аудита по REST-вызову.
+
+        БЕЗОПАСНОСТЬ: в аудит идут ТОЛЬКО ключи параметров (param_keys), НИКОГДА их
+        значения и НИКОГДА код вебхука. Любая ошибка записи аудита не прерывает вызов
+        (логируется через log.debug).
+        """
+        if write_audit_row is None or self._audit_file is None:
+            return
+        row: Dict[str, Any] = {
+            "ts": int(time.time()),
+            "request_id": request_id,
+            "tenant": self.config.env.domain,
+            "method": method,
+            "status": status,
+            "duration_ms": int((time.time() - started) * 1000),
+            "param_keys": sorted(params.keys()) if isinstance(params, dict) else [],
+        }
+        if status == "error":
+            row["error_code"] = error_code
+            row["error_message"] = error_message
+        try:
+            write_audit_row(self._audit_file, row)
+        except Exception as exc:  # аудит не должен ронять основной поток
+            log.debug("Не удалось записать строку аудита (%s): %s", method, exc)
+
+    def _audited_call(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Единая аудируемая точка вызова client.call.
+
+        Через неё проходят все REST-вызовы обёртки (call/item_list_all), чтобы на каждый
+        писалась ровно одна строка аудита. Ошибки клиента преобразуются в B24Error.
+        """
+        request_id = uuid.uuid4().hex[:12]
+        started = time.time()
+        call_params = params or {}
+        try:
+            response = self.client.call(method, params=call_params)
+        except BitrixAPIError as exc:
+            self._write_audit(
+                method, call_params, started, request_id,
+                status="error", error_code=exc.code, error_message=str(exc),
+            )
+            raise _wrap_error(exc) from None
+        self._write_audit(method, call_params, started, request_id, status="ok")
+        return response
+
     # --- Базовый вызов ---
     def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Вызвать произвольный REST-метод, перехватив ошибки в B24Error."""
-        try:
-            return self.client.call(method, params=params or {})
-        except BitrixAPIError as exc:
-            raise _wrap_error(exc) from None
+        """Вызвать произвольный REST-метод, перехватив ошибки в B24Error (с аудитом)."""
+        return self._audited_call(method, params)
 
     def user_current(self) -> Dict[str, Any]:
         """user.current — для smoke-проверки доступа (read-only)."""
@@ -217,10 +295,9 @@ class B24:
         start = 0
         while True:
             page_params = {**params, "start": start}
-            try:
-                response = self.client.call("crm.item.list", params=page_params)
-            except BitrixAPIError as exc:
-                raise _wrap_error(exc) from None
+            # Идём через единую аудируемую точку: каждая страница пагинации фиксируется
+            # в аудите отдельной строкой (только ключи параметров, без значений).
+            response = self._audited_call("crm.item.list", page_params)
 
             items = _result_items(response)
             collected.extend(items)
@@ -361,10 +438,19 @@ class B24:
 
         commands — {name: 'method?param=value'}; halt: 0 (продолжать) / 1 (стоп на ошибке).
         """
+        request_id = uuid.uuid4().hex[:12]
+        started = time.time()
         try:
-            return self.client.batch(commands, halt=bool(halt))
+            response = self.client.batch(commands, halt=bool(halt))
         except BitrixAPIError as exc:
+            # param_keys = имена команд (не значения и не код вебхука).
+            self._write_audit(
+                "batch", commands, started, request_id,
+                status="error", error_code=exc.code, error_message=str(exc),
+            )
             raise _wrap_error(exc) from None
         except ValueError as exc:
             # Например, >50 команд — отдаём читаемо, без трейсбека.
             raise B24Error(f"Некорректный batch-запрос: {exc}") from None
+        self._write_audit("batch", commands, started, request_id, status="ok")
+        return response
