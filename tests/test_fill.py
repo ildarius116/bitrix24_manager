@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import types
 from collections import deque
 from datetime import date
@@ -1143,3 +1144,98 @@ class TestRunFillJournal:
         assert results == []
         assert len(is_proc_calls) == 0
         assert len(mark_calls) == 0
+
+    # -------------------------------------------------------------------
+    # Тест 5 (error-ветки ревью): сбой mark_processed не роняет run_fill
+    # -------------------------------------------------------------------
+
+    def test_mark_processed_failure_does_not_crash_run_fill(self, monkeypatch, caplog):
+        """Сбой mark_processed (OSError) не роняет run_fill.
+
+        Ожидаем:
+        - run_fill НЕ бросает исключение;
+        - оба кандидата получают статус 'filled' (сбой журнала не меняет статус);
+        - цикл доходит до конца для обоих кандидатов;
+        - log.warning записан о каждом сбое журнала.
+        """
+        cfg = self._setup_cfg()
+        day1 = _make_day(day_id=100, d=TODAY)
+        day2 = _make_day(day_id=101, d=TODAY)
+
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day1, day2])
+        monkeypatch.setattr(
+            "src.workday.select_candidates",
+            lambda days, cfg, today, limit=5: days,
+        )
+        monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
+        monkeypatch.setattr(
+            "src.fill.is_processed",
+            lambda journal, day_id, ttl_sec, now_ts: False,
+        )
+
+        # mark_processed всегда бросает OSError — имитируем «диск переполнен»
+        def raise_oserror(*a, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("src.fill.mark_processed", raise_oserror)
+
+        # item_add возвращает id=777 для обоих кандидатов.
+        # Для каждого кандидата нужно: 1 item_get (guard) + 2 item_get (verify_log).
+        cfg_ns = cfg
+        b24 = FakeB24(
+            item_get_responses=[
+                # Кандидат 1: _reread_guard
+                {
+                    "id": 100,
+                    cfg_ns.field_workday_date: TODAY.isoformat(),
+                    cfg_ns.field_workday_works: [],
+                },
+                # Кандидат 1: verify_log — день
+                {"id": 100, cfg_ns.field_workday_works: ["777"]},
+                # Кандидат 1: verify_log — учёт
+                {
+                    "id": 777,
+                    cfg_ns.field_log_parent: "100",
+                    cfg_ns.field_log_description: "Общие задачи подразделения",
+                    cfg_ns.field_log_hours: "8.0",
+                },
+                # Кандидат 2: _reread_guard
+                {
+                    "id": 101,
+                    cfg_ns.field_workday_date: TODAY.isoformat(),
+                    cfg_ns.field_workday_works: [],
+                },
+                # Кандидат 2: verify_log — день
+                {"id": 101, cfg_ns.field_workday_works: ["777"]},
+                # Кандидат 2: verify_log — учёт
+                {
+                    "id": 777,
+                    cfg_ns.field_log_parent: "101",
+                    cfg_ns.field_log_description: "Общие задачи подразделения",
+                    cfg_ns.field_log_hours: "8.0",
+                },
+            ],
+            item_add_response={"id": 777},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="workday"):
+            results = run_fill(
+                b24, cfg_ns, dry_run=False, interaction=False, today=TODAY, limit=5
+            )
+
+        # run_fill не упал (исключение проглочено в try/except)
+        assert len(results) == 2, (
+            f"Ожидалось 2 результата (цикл дошёл до конца), получили {len(results)}"
+        )
+        # Оба кандидата имеют статус filled — сбой журнала не меняет статус
+        assert results[0]["status"] == "filled", (
+            f"Ожидался filled для дня 100: {results[0]}"
+        )
+        assert results[1]["status"] == "filled", (
+            f"Ожидался filled для дня 101: {results[1]}"
+        )
+        # log.warning записан хотя бы один раз о сбое журнала
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("не удалось записать журнал" in m for m in warning_msgs), (
+            f"Ожидалось предупреждение о сбое журнала, получено: {warning_msgs}"
+        )

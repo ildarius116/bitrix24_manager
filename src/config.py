@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-log = logging.getLogger("workday")
-
 import yaml
 
 try:
@@ -26,6 +24,8 @@ except ImportError as exc:  # pragma: no cover - зависимость объя
         "Не установлен python-dotenv. Выполните: "
         "venv/Scripts/python.exe -m pip install -r requirements.txt"
     ) from exc
+
+log = logging.getLogger("workday")
 
 
 # Корень проекта = родитель каталога src/.

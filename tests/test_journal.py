@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import types
 from pathlib import Path
 
@@ -266,11 +268,41 @@ class TestMarkProcessed:
         assert p.exists()
 
     def test_tmp_file_cleaned_up(self, tmp_path):
-        """Временный файл .tmp убирается после записи."""
+        """Временный файл .tmp убирается после успешной записи."""
         p = tmp_path / "processed.json"
         mark_processed(p, 10, "2026-06-25", 1, now_ts=1000)
         tmp = p.parent / (p.name + ".tmp")
         assert not tmp.exists()
+
+    def test_tmp_cleaned_on_os_replace_failure(self, tmp_path, monkeypatch):
+        """os.replace сбоит после создания tmp → исключение пробрасывается, .tmp-файл удалён.
+
+        Проверяем две гарантии реализации:
+        1) исключение НЕ проглатывается mark_processed (пробрасывается наружу);
+        2) осиротевший .tmp-файл удалён в except-блоке (не остаётся на диске).
+        """
+        p = tmp_path / "processed.json"
+        tmp_file = tmp_path / "processed.json.tmp"
+
+        def fail_replace(src, dst):
+            raise OSError("replace failed: disk full")
+
+        # Патчим os.replace в самом модуле os — src.journal использует тот же объект модуля.
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        # Исключение должно пробрасываться наружу (mark_processed не глушит его).
+        with pytest.raises(OSError, match="replace failed"):
+            mark_processed(p, 42, "2026-06-25", 999, now_ts=10000)
+
+        # .tmp-файл создаётся через write_text до вызова os.replace.
+        # После сбоя except-блок должен его удалить.
+        assert not tmp_file.exists(), (
+            ".tmp-файл должен быть удалён при сбое os.replace"
+        )
+        # Основной файл не создан (os.replace не выполнился).
+        assert not p.exists(), (
+            "processed.json не должен существовать при сбое os.replace"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -356,3 +388,41 @@ class TestJournalTtlSec:
         """journal_ttl_sec возвращает int, а не float."""
         cfg = self._make_config({"journal_ttl_days": 7})
         assert isinstance(cfg.journal_ttl_sec, int)
+
+    # --- Ветки фолбэка на некорректных значениях (error-ветки ревью) ---
+
+    def test_string_garbage_ttl_days_returns_default_with_warning(self, caplog):
+        """journal_ttl_days='abc' (нечисловая строка) → fallback 604800 + log.warning."""
+        cfg = self._make_config({"journal_ttl_days": "abc"})
+        with caplog.at_level(logging.WARNING, logger="workday"):
+            result = cfg.journal_ttl_sec
+        assert result == 7 * 86400, (
+            f"Ожидался fallback 604800 при нечисловом journal_ttl_days, получено {result}"
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "Ожидалось log.warning при journal_ttl_days='abc'"
+        )
+
+    def test_none_ttl_days_returns_default_with_warning(self, caplog):
+        """journal_ttl_days=None → fallback 604800 + log.warning."""
+        cfg = self._make_config({"journal_ttl_days": None})
+        with caplog.at_level(logging.WARNING, logger="workday"):
+            result = cfg.journal_ttl_sec
+        assert result == 7 * 86400, (
+            f"Ожидался fallback 604800 при journal_ttl_days=None, получено {result}"
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "Ожидалось log.warning при journal_ttl_days=None"
+        )
+
+    def test_list_ttl_days_returns_default_with_warning(self, caplog):
+        """journal_ttl_days=[] (список) → fallback 604800 + log.warning."""
+        cfg = self._make_config({"journal_ttl_days": []})
+        with caplog.at_level(logging.WARNING, logger="workday"):
+            result = cfg.journal_ttl_sec
+        assert result == 7 * 86400, (
+            f"Ожидался fallback 604800 при journal_ttl_days=[], получено {result}"
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "Ожидалось log.warning при journal_ttl_days=[]"
+        )
