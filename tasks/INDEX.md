@@ -46,6 +46,16 @@
   Журнал идемпотентности `.runtime/processed.json`, аудит REST `.runtime/bitrix24_audit.jsonl`.
   Коммиты: `9b86384` (реализация) + `39a1834` (верификационные тесты + nit). Re-review: approve.
 
+## Фаза 6 — GUI: десктопная обёртка PySide6 (GUI_SPEC.md / PLAN_GUI.md) [TODO]
+- `phase_6_00_overview.md`
+- `phase_6_01_skeleton_theme.md` — каркас окна + вендоренная тема (ThemeManager + QSS) [coder-expert]
+- `phase_6_02_log_params_statusbar.md` — лог (QLoggingHandler), параметры, статусбар [coder-simple]
+- `phase_6_03_ribbon_workers_table.md` — ribbon, QThread-воркеры, таблица/детали [coder-expert]
+- `phase_6_04_confirm_dialog_menu.md` — диалог подтверждения fill + меню/темы [coder-simple]
+- `phase_6_05_deps_tests_docs.md` — PySide6, тесты, ревью, документация [tester/reviewer/docs-keeper]
+- Решения: тема вендорится из USP; интерактив fill — monkeypatch `builtins.input` (src/ не меняем);
+  объём строго по GUI_SPEC.md.
+
 ## Отложенные
 - `phase_delayed_1_01_task_elapseditem.md` — альтернативный механизм через task.elapseditem
 - `phase_delayed_1_02_browser_fallback.md` — браузерный fallback (REST полностью покрывает «Выполнено» через crm.activity.update; fallback не нужен)
