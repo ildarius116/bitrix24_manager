@@ -228,6 +228,32 @@ QPushButton#CtaButton:disabled {
     color: @text_muted@;
 }
 
+/* --- Кнопка «↻ Обновить» (статусы дней, метод «Индивидуально») --- */
+QPushButton#RefreshDaysButton {
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #ffffff;
+    background: @accent@;
+    border: 1px solid @accent@;
+    border-radius: 5px;
+}
+
+QPushButton#RefreshDaysButton:hover {
+    background: @accent_hover@;
+    border-color: @accent_hover@;
+}
+
+QPushButton#RefreshDaysButton:pressed {
+    background: @accent_deep@;
+}
+
+QPushButton#RefreshDaysButton:disabled {
+    background: @btn_disabled_bg@;
+    border-color: @border@;
+    color: @text_muted@;
+}
+
 /* ===== Правая тёмная консоль (всегда тёмная независимо от темы) ===== */
 QWidget#ConsolePanel {
     background: @log_bg@;

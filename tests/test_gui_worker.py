@@ -1,40 +1,41 @@
-"""Тесты gui/worker.py::FillWorker — фейковый input, диалог «ко всем» (фаза 6_05).
+"""Тесты gui/worker.py: фейковый input метода «Индивидуально» + classify_day_states.
 
-Без сети, без реального QThread.start()/run(): тестируем _fake_input/
-_request_confirmation напрямую, подменяя блокирующий механизм ожидания ответа
-(``provide_confirmation``) синхронным вызовом из того же потока — _request_confirmation
-блокируется на QWaitCondition.wait() до ``self._response`` не станет не-None, поэтому
-в тесте мы заранее кладём ответ в FillWorker._response через provide_confirmation()
-ДО вызова _fake_input (тест синхронный, без реальной параллельности).
+Без сети, без реального QThread.start()/run(): тестируем ``_fake_input`` синхронно.
+Метод «Индивидуально» (фаза 8_01) решает судьбу дня по левой панели
+(``selected_days`` / ``per_day_values``) и дате из ``_last_day_date`` — без per-day
+диалога/блокировки потока.
 
 Требует offscreen QApplication, т.к. FillWorker — QThread (QObject иерархия).
 """
 
 from __future__ import annotations
 
-import threading
-import time
+import types
+from datetime import date
 
-import pytest
-
-from gui.worker import FillWorker
+from gui.worker import FillWorker, classify_day_states
 
 
-def _make_worker(qapp, *, interaction=True, dry_run=False, today=None):
-    from datetime import date
-
-    import types
-
+def _make_worker(
+    qapp,
+    *,
+    interaction=True,
+    dry_run=False,
+    today=None,
+    selected_days=None,
+    per_day_values=None,
+):
     cfg = types.SimpleNamespace()  # FillWorker.__init__ не обращается к содержимому cfg
-    worker = FillWorker(
+    return FillWorker(
         cfg,
         dry_run=dry_run,
         interaction=interaction,
         today=today or date(2026, 6, 25),
         description="Общие задачи подразделения",
         hours=8.0,
+        selected_days=selected_days,
+        per_day_values=per_day_values,
     )
-    return worker
 
 
 # ---------------------------------------------------------------------------
@@ -43,177 +44,174 @@ def _make_worker(qapp, *, interaction=True, dry_run=False, today=None):
 
 
 class TestFakeInputPromptRecognition:
-    def test_hours_prompt_returns_current_hours_without_dialog(self, qapp):
-        """Промпт «Количество часов» возвращает текущие часы строкой, без сигнала."""
+    def test_hours_prompt_returns_current_hours(self, qapp):
         worker = _make_worker(qapp)
         worker._current_hours = 6.5
-        received = []
-        worker.confirm_requested.connect(lambda info: received.append(info))
-
-        result = worker._fake_input("  Количество часов [Enter=8]: ")
-
-        assert result == "6.5"
-        assert received == []  # диалог НЕ вызывается на промпте часов
+        assert worker._fake_input("  Количество часов [Enter=8]: ") == "6.5"
 
     def test_unknown_prompt_returns_empty_string(self, qapp):
-        """Промпт без «Описание»/«Количество часов»/«ко всем» — пустая строка (Enter)."""
         worker = _make_worker(qapp)
         assert worker._fake_input("какой-то другой текст") == ""
 
-    def test_apply_to_all_prompt_from_run_fill_returns_n(self, qapp):
-        """run_fill спрашивает «Применить ко всем? [y/N]» — воркер всегда отвечает 'N'
-
-        (логика «ко всем» реализована на уровне воркера через _applied_all, поэтому
-        run_fill не должен сам зафиксировать свой собственный applied_to_all).
-        """
+    def test_apply_to_all_prompt_returns_n(self, qapp):
+        """run_fill спрашивает «Применить ко всем? [y/N]» — воркер всегда отвечает 'N'."""
         worker = _make_worker(qapp)
         result = worker._fake_input("  Применить эти значения ко всем оставшимся дням? [y/N]: ")
         assert result == "N"
 
-    def test_description_prompt_triggers_confirmation_when_no_cache(self, qapp):
-        """Промпт «Описание» без кэша «ко всем» запрашивает подтверждение у main thread."""
-        worker = _make_worker(qapp)
-
-        # Подложить ответ заранее (синхронный тест, без реального параллелизма):
-        # _request_confirmation блокируется на QWaitCondition, ждущей self._response.
-        # Запустим ответ в отдельном потоке с небольшой задержкой, чтобы имитировать
-        # асинхронный main thread, отвечающий через provide_confirmation().
-        def _respond_later():
-            time.sleep(0.05)
-            worker.provide_confirmation(
-                {"choice": "ok", "description": "Моя задача", "hours": 5.0}
-            )
-
-        received = []
-        worker.confirm_requested.connect(lambda info: received.append(info))
-        t = threading.Thread(target=_respond_later, daemon=True)
-        t.start()
-
-        result = worker._fake_input("  Описание задачи [Enter=дефолт]: ")
-        t.join(timeout=2)
-
-        assert result == "Моя задача"
-        assert len(received) == 1
-        assert received[0]["default_description"] == "Общие задачи подразделения"
-        assert received[0]["default_hours"] == 8.0
-
 
 # ---------------------------------------------------------------------------
-# Маппинг ответов диалога choice → возвращаемое значение _request_confirmation.
+# Метод «Индивидуально»: описание решается по selected_days / per_day_values.
 # ---------------------------------------------------------------------------
 
 
-class TestRequestConfirmationChoiceMapping:
-    def _ask(self, worker, response: dict):
-        """Запустить _request_confirmation и сразу ответить из другого потока."""
-        def _respond():
-            time.sleep(0.02)
-            worker.provide_confirmation(response)
+class TestIndividualDescriptionResolution:
+    def test_no_selection_falls_back_to_default_description(self, qapp):
+        """selected_days=None (метод «По-умолчанию») → дефолтное описание для любого дня."""
+        worker = _make_worker(qapp, selected_days=None)
+        worker._last_day_date = "25.06.2026"
+        assert worker._fake_input("  Описание задачи [Enter=дефолт]: ") == (
+            "Общие задачи подразделения"
+        )
 
-        t = threading.Thread(target=_respond, daemon=True)
-        t.start()
-        result = worker._request_confirmation()
-        t.join(timeout=2)
-        return result
+    def test_unselected_day_returns_skip(self, qapp):
+        """День НЕ в selected_days → «skip» (collect_values пропустит его)."""
+        worker = _make_worker(
+            qapp,
+            selected_days={date(2026, 6, 24)},
+            per_day_values={date(2026, 6, 24): ("desc", 5.0)},
+        )
+        worker._last_day_date = "25.06.2026"  # другой день
+        assert worker._fake_input("  Описание задачи [Enter=дефолт]: ") == "skip"
 
-    def test_choice_ok_returns_description_and_updates_current_values(self, qapp):
+    def test_selected_day_returns_inline_desc_and_sets_hours(self, qapp):
+        """Отмеченный день → его инлайн-описание и инлайн-часы (для промпта часов)."""
+        d = date(2026, 6, 25)
+        worker = _make_worker(
+            qapp,
+            selected_days={d},
+            per_day_values={d: ("Моя задача", 3.5)},
+        )
+        worker._last_day_date = "25.06.2026"
+
+        desc = worker._fake_input("  Описание задачи [Enter=дефолт]: ")
+        hours = worker._fake_input("  Количество часов [Enter=8]: ")
+
+        assert desc == "Моя задача"
+        assert hours == "3.5"
+
+    def test_selected_but_missing_values_uses_defaults(self, qapp):
+        """Отмечен, но нет записи в per_day_values → дефолтные описание/часы."""
+        d = date(2026, 6, 25)
+        worker = _make_worker(qapp, selected_days={d}, per_day_values={})
+        worker._last_day_date = "25.06.2026"
+        assert worker._fake_input("  Описание задачи [Enter=дефолт]: ") == (
+            "Общие задачи подразделения"
+        )
+        assert worker._fake_input("  Количество часов [Enter=8]: ") == "8.0"
+
+    def test_unparsable_day_date_returns_skip(self, qapp):
+        """Если дата дня не распознана (_last_day_date пуст/битый) → «skip» (безопасно)."""
+        worker = _make_worker(qapp, selected_days={date(2026, 6, 25)})
+        worker._last_day_date = ""
+        assert worker._fake_input("  Описание задачи [Enter=дефолт]: ") == "skip"
+
+    def test_empty_selection_skips_every_day(self, qapp):
+        """selected_days=set() (все сняты) → каждый день «skip»."""
+        worker = _make_worker(qapp, selected_days=set())
+        worker._last_day_date = "25.06.2026"
+        assert worker._fake_input("  Описание задачи [Enter=дефолт]: ") == "skip"
+
+
+class TestParseLastDayDate:
+    def test_valid(self, qapp):
         worker = _make_worker(qapp)
-        result = self._ask(worker, {"choice": "ok", "description": "Задача X", "hours": 3.0})
-        assert result == "Задача X"
-        assert worker._current_description == "Задача X"
-        assert worker._current_hours == 3.0
-        assert worker._applied_all is None
+        worker._last_day_date = "01.07.2026"
+        assert worker._parse_last_day_date() == date(2026, 7, 1)
 
-    def test_choice_skip_returns_skip_literal(self, qapp):
+    def test_empty_returns_none(self, qapp):
         worker = _make_worker(qapp)
-        result = self._ask(worker, {"choice": "skip"})
-        assert result == "skip"
+        worker._last_day_date = ""
+        assert worker._parse_last_day_date() is None
 
-    def test_choice_abort_returns_abort_literal(self, qapp):
+    def test_garbage_returns_none(self, qapp):
         worker = _make_worker(qapp)
-        result = self._ask(worker, {"choice": "abort"})
-        assert result == "abort"
-
-    def test_choice_all_returns_description_and_sets_cache(self, qapp):
-        worker = _make_worker(qapp)
-        result = self._ask(worker, {"choice": "all", "description": "Массовая", "hours": 7.5})
-        assert result == "Массовая"
-        assert worker._applied_all == {"description": "Массовая", "hours": 7.5}
-
-    def test_missing_description_falls_back_to_default(self, qapp):
-        worker = _make_worker(qapp)
-        result = self._ask(worker, {"choice": "ok"})
-        assert result == worker._default_description
-
-    def test_invalid_hours_falls_back_to_default_hours(self, qapp):
-        worker = _make_worker(qapp)
-        self._ask(worker, {"choice": "ok", "description": "X", "hours": "не число"})
-        assert worker._current_hours == worker._default_hours
+        worker._last_day_date = "не дата"
+        assert worker._parse_last_day_date() is None
 
 
 # ---------------------------------------------------------------------------
-# Кэш «применить ко всем»: после choice="all" последующие дни НЕ зовут диалог.
+# classify_day_states — чистая функция (Часть A), без сети.
 # ---------------------------------------------------------------------------
 
 
-class TestAppliedToAllCache:
-    def test_after_apply_all_subsequent_description_prompt_skips_dialog(self, qapp):
-        """После choice='all' второй вызов _fake_input('Описание...') не эмитит confirm_requested."""
-        worker = _make_worker(qapp)
-        worker._applied_all = {"description": "Кэш-задача", "hours": 4.0}
+def _cfg(edit_window_days=4, work_ids=(351,)):
+    return types.SimpleNamespace(
+        edit_window_days=edit_window_days,
+        day_type_work_ids=list(work_ids),
+    )
 
-        received = []
-        worker.confirm_requested.connect(lambda info: received.append(info))
 
-        result = worker._fake_input("  Описание задачи [Enter=дефолт]: ")
+def _day(d, *, day_type_id=351, works_ids=()):
+    return types.SimpleNamespace(
+        id=1,
+        title="день",
+        date=d,
+        day_type_id=day_type_id,
+        works_ids=list(works_ids),
+    )
 
-        assert result == "Кэш-задача"
-        assert received == []  # диалог НЕ вызывается — значения взяты из кэша
 
-    def test_applied_all_also_updates_current_hours_for_next_prompt(self, qapp):
-        """После применения кэша «ко всем» промпт часов того же дня отдаёт закэшированное."""
-        worker = _make_worker(qapp)
-        worker._applied_all = {"description": "Кэш-задача", "hours": 4.0}
+class TestClassifyDayStates:
+    def test_window_covers_edit_window_plus_today(self, qapp):
+        today = date(2026, 6, 25)
+        states = classify_day_states([], _cfg(edit_window_days=4), today)
+        assert len(states) == 5  # today .. today-4
+        assert set(states) == {
+            date(2026, 6, d).isoformat() for d in (21, 22, 23, 24, 25)
+        }
 
-        worker._fake_input("  Описание задачи [Enter=дефолт]: ")
-        hours_result = worker._fake_input("  Количество часов [Enter=8]: ")
+    def test_missing_day_is_not_fillable(self, qapp):
+        today = date(2026, 6, 25)
+        states = classify_day_states([], _cfg(), today)
+        st = states[today.isoformat()]
+        assert st["fillable"] is False
+        assert "нет записи" in st["reason"]
 
-        assert hours_result == "4.0"
+    def test_non_work_type_not_fillable(self, qapp):
+        today = date(2026, 6, 25)
+        days = [_day(today, day_type_id=352)]  # отпуск
+        st = classify_day_states(days, _cfg(), today)[today.isoformat()]
+        assert st["fillable"] is False
+        assert st["reason"] == "не рабочий день"
 
-    def test_cache_persists_across_multiple_days(self, qapp):
-        """Кэш «ко всем» не очищается между несколькими последующими днями."""
-        worker = _make_worker(qapp)
-        worker._applied_all = {"description": "Для всех", "hours": 6.0}
+    def test_already_filled_not_fillable(self, qapp):
+        today = date(2026, 6, 25)
+        days = [_day(today, works_ids=[10, 11])]
+        st = classify_day_states(days, _cfg(), today)[today.isoformat()]
+        assert st["fillable"] is False
+        assert st["reason"] == "уже заполнен (2)"
 
-        received = []
-        worker.confirm_requested.connect(lambda info: received.append(info))
-
-        for _ in range(3):
-            desc = worker._fake_input("  Описание задачи [Enter=дефолт]: ")
-            hrs = worker._fake_input("  Количество часов [Enter=8]: ")
-            assert desc == "Для всех"
-            assert hrs == "6.0"
-
-        assert received == []
+    def test_empty_work_day_is_fillable(self, qapp):
+        today = date(2026, 6, 25)
+        days = [_day(today, works_ids=[])]
+        st = classify_day_states(days, _cfg(), today)[today.isoformat()]
+        assert st["fillable"] is True
+        assert st["reason"] == ""
 
 
 # ---------------------------------------------------------------------------
-# provide_confirmation — формат ответа.
+# SHOULD-FIX: значения инлайн-полей «Редактирование» применяются к cfg.defaults и в auto.
 # ---------------------------------------------------------------------------
 
 
 class TestDefaultsOverride:
-    """SHOULD-FIX #2: значения инлайн-полей «Редактирование» применяются к cfg.defaults и в auto.
-
-    run_fill (src/fill.py, не меняем) читает описание/часы из cfg.defaults, а не из
+    """run_fill (src/fill.py, не меняем) читает описание/часы из cfg.defaults, а не из
     аргументов. FillWorker временно переопределяет cfg.defaults на время прогона и
     восстанавливает исходные значения в finally.
     """
 
     def _worker_with_defaults(self, qapp, defaults):
-        import types
-        from datetime import date
-
         cfg = types.SimpleNamespace(defaults=defaults)
         return FillWorker(
             cfg,
@@ -229,14 +227,11 @@ class TestDefaultsOverride:
         worker = self._worker_with_defaults(qapp, defaults)
 
         saved = worker._apply_defaults_override()
-        # Во время прогона run_fill увидит значения диалога.
         assert defaults["task_description"] == "Из диалога"
         assert defaults["hours"] == 3.5
-        # Прочие ключи defaults не тронуты.
         assert defaults["contract_tech_id"] == "2"
 
         worker._restore_defaults(saved)
-        # После восстановления — исходные значения config.
         assert defaults["task_description"] == "Из config"
         assert defaults["hours"] == 8
         assert defaults["contract_tech_id"] == "2"
@@ -244,29 +239,12 @@ class TestDefaultsOverride:
     def test_override_noop_when_defaults_not_dict(self, qapp):
         worker = self._worker_with_defaults(qapp, None)
         assert worker._apply_defaults_override() is None
-        # restore не падает на None-снимке.
         worker._restore_defaults(None)
 
 
-class TestProvideConfirmation:
-    def test_default_choice_ok_when_response_falsy(self, qapp):
-        """provide_confirmation(None/{}) трактуется как choice='ok' (см. docstring)."""
+class TestProvideConfirmationNoop:
+    def test_provide_confirmation_is_noop(self, qapp):
+        """provide_confirmation оставлен как no-op (совместимость с closeEvent)."""
         worker = _make_worker(qapp)
-        worker._waiting = True  # эмулируем фазу ожидания подтверждения (иначе вызов — no-op)
-        worker.provide_confirmation(None)
-        assert worker._response == {"choice": "ok"}
-
-    def test_response_stored_as_dict_copy(self, qapp):
-        worker = _make_worker(qapp)
-        worker._waiting = True  # эмулируем фазу ожидания подтверждения (иначе вызов — no-op)
-        original = {"choice": "skip"}
-        worker.provide_confirmation(original)
-        assert worker._response == {"choice": "skip"}
-        assert worker._response is not original
-
-    def test_provide_confirmation_noop_when_not_waiting(self, qapp):
-        """Идемпотентность: вне фазы ожидания provide_confirmation ничего не пишет."""
-        worker = _make_worker(qapp)
-        assert worker._waiting is False
-        worker.provide_confirmation({"choice": "abort"})
-        assert worker._response is None
+        # Не должно бросать и ничего не менять.
+        assert worker.provide_confirmation({"choice": "abort"}) is None

@@ -15,8 +15,10 @@
       с датами; у отмеченных показывается «<описание> · <часы> ч»;
     * «Запланировать» — чекбокс + время (визуально; запуск «сразу»).
 
-Dry-run в GUI нет: боевая запись гейтится подтверждением в главном окне (QMessageBox
-для «По-умолчанию», per-day ConfirmDialog для «Индивидуально»).
+Dry-run в GUI нет: боевая запись гейтится одним подтверждением в главном окне
+(QMessageBox). В методе «Индивидуально» пишутся ТОЛЬКО отмеченные дни своими инлайн-
+значениями (без per-day поп-апа), а недоступные дни окна (уже заполнены / не рабочий
+тип / вне окна / нет записи) блокируются по статусам с портала (см. ``apply_day_states``).
 
 Виджет не содержит REST/бизнес-логики: только собирает параметры и эмитит сигналы.
 """
@@ -52,8 +54,9 @@ _DATE_FORMAT = "dd.MM.yyyy"
 MODE_EXPORT = "export"
 MODE_FILL = "fill"
 
-# Метод заполнения (fill): auto — значения по умолчанию без вопросов;
-# interactive — подтверждение по каждому дню (безопаснее, дефолт).
+# Метод заполнения (fill): auto («По-умолчанию», дефолт) — общие значения для всех
+# кандидатов; interactive («Индивидуально») — пишутся только отмеченные дни своими
+# инлайн-значениями, недоступные дни окна блокируются по статусам с портала.
 METHOD_AUTO = "auto"
 METHOD_INTERACTIVE = "interactive"
 
@@ -82,13 +85,17 @@ class ControlPanel(QWidget):
     run_requested = Signal()
     mode_changed = Signal(str)
     row_selected = Signal(object)
+    day_states_requested = Signal()
 
     def __init__(self, config, parent: "QWidget | None" = None) -> None:
         super().__init__(parent)
         self.setObjectName("ControlPanel")
         self._config = config
         self._mode = MODE_EXPORT
-        self._day_rows: list[tuple[QCheckBox, date, QLabel]] = []
+        # Строки дней: (checkbox, date, info_label, edit_wrap, desc_edit, hours_spin, reason_label).
+        self._day_rows: list[tuple] = []
+        # Последняя применённая карта статусов дней (iso→{fillable,reason}) или None.
+        self._day_states: "dict | None" = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -250,9 +257,21 @@ class ControlPanel(QWidget):
         box.addLayout(hours_col)
 
         # --- ДНИ ДЛЯ ЗАПОЛНЕНИЯ (4-дневное окно) ---
-        days_caption = QLabel("ДНИ ДЛЯ ЗАПОЛНЕНИЯ", frame)
-        days_caption.setObjectName("SectionCaption")
-        box.addWidget(days_caption)
+        # Шапка секции: заголовок + кнопка «↻ Обновить» (видна только в «Индивидуально»,
+        # перезапрашивает статусы дней с портала для блокировки недоступных чекбоксов).
+        days_header = QHBoxLayout()
+        days_header.setSpacing(8)
+        self._days_caption = QLabel("ДНИ ДЛЯ ЗАПОЛНЕНИЯ", frame)
+        self._days_caption.setObjectName("SectionCaption")
+        days_header.addWidget(self._days_caption)
+        days_header.addStretch(1)
+        self._refresh_days_btn = QPushButton("↻ Обновить", frame)
+        self._refresh_days_btn.setObjectName("RefreshDaysButton")
+        self._refresh_days_btn.setToolTip("Перезапросить доступность дней с портала")
+        self._refresh_days_btn.clicked.connect(self._maybe_request_day_states)
+        self._refresh_days_btn.setVisible(False)
+        days_header.addWidget(self._refresh_days_btn)
+        box.addLayout(days_header)
 
         today = today_moscow()
         for offset, label in enumerate(_DAY_LABELS):
@@ -267,6 +286,8 @@ class ControlPanel(QWidget):
 
         # Метод меняет вид строк: «Индивидуально» → поля ввода, «По-умолчанию» → текст.
         self._method_combo.currentIndexChanged.connect(self._refresh_day_rows)
+        # …и управляет блокировкой недоступных дней (запрос статусов / снятие блокировки).
+        self._method_combo.currentIndexChanged.connect(self._on_method_changed)
 
         # --- Запланировать (визуально; запуск «сразу») ---
         sched = QHBoxLayout()
@@ -279,9 +300,10 @@ class ControlPanel(QWidget):
         self._schedule_time.setTime(QTime(9, 0))
         self._schedule_time.setEnabled(False)
         self._schedule_check.toggled.connect(self._schedule_time.setEnabled)
+        self._schedule_hint = QLabel("24ч", frame)
         sched.addWidget(self._schedule_check)
         sched.addWidget(self._schedule_time)
-        sched.addWidget(QLabel("24ч", frame))
+        sched.addWidget(self._schedule_hint)
         sched.addStretch(1)
         box.addLayout(sched)
 
@@ -295,7 +317,7 @@ class ControlPanel(QWidget):
 
     def _make_day_row(
         self, parent: QWidget, label: str, d: date
-    ) -> tuple[QFrame, QCheckBox, date, QLabel, QWidget, QLineEdit, QDoubleSpinBox]:
+    ) -> tuple[QFrame, QCheckBox, date, QLabel, QWidget, QLineEdit, QDoubleSpinBox, QLabel]:
         row = QFrame(parent)
         row.setObjectName("DayRow")
         lay = QHBoxLayout(row)
@@ -311,6 +333,12 @@ class ControlPanel(QWidget):
         lay.addWidget(date_lbl)
 
         lay.addStretch(1)
+
+        # Причина недоступности («Индивидуально»): показывается у заблокированных дней.
+        reason = QLabel("", row)
+        reason.setObjectName("DayReason")
+        reason.setVisible(False)
+        lay.addWidget(reason)
 
         # «По-умолчанию»: статический текст «<описание> · <часы> ч».
         info = QLabel("", row)
@@ -339,7 +367,7 @@ class ControlPanel(QWidget):
         edit_wrap.setVisible(False)
         lay.addWidget(edit_wrap)
 
-        return row, checkbox, d, info, edit_wrap, desc_edit, hours_spin
+        return row, checkbox, d, info, edit_wrap, desc_edit, hours_spin, reason
 
     def _refresh_day_rows(self) -> None:
         """Вид строк дней зависит от метода и отметки:
@@ -351,7 +379,7 @@ class ControlPanel(QWidget):
         interactive = self._method_combo.currentData() == METHOD_INTERACTIVE
         desc = self._description.text().strip()
         hours = self._hours.value()
-        for checkbox, _d, info, edit_wrap, _desc_edit, _hours_spin in self._day_rows:
+        for checkbox, _d, info, edit_wrap, _desc_edit, _hours_spin, _reason in self._day_rows:
             checked = checkbox.isChecked()
             if not checked:
                 info.setVisible(False)
@@ -385,9 +413,119 @@ class ControlPanel(QWidget):
         self._period_section.setVisible(is_export)
         self._edit_section.setVisible(not is_export)
         self._cta.setText(_CTA_TEXT[mode])
+        self._sync_refresh_btn_visibility()
+        self._sync_schedule_enabled()
 
         if emit:
+            # Реальное переключение режима пользователем: в «Индивидуально» (fill)
+            # запросить статусы дней, иначе снять блокировку. При emit=False (восстановление
+            # после busy) сеть не дёргаем — только пере-применяем уже известную блокировку.
+            if self._is_individual_fill():
+                self._maybe_request_day_states()
+            else:
+                self._unblock_all_days()
             self.mode_changed.emit(mode)
+        else:
+            self._reapply_block_state()
+
+    # ------------------------------------------------------------------
+    # Блокировка недоступных дней (Часть A, только метод «Индивидуально»)
+    # ------------------------------------------------------------------
+    def _is_individual_fill(self) -> bool:
+        return (
+            self._mode == MODE_FILL
+            and self._method_combo.currentData() == METHOD_INTERACTIVE
+        )
+
+    def _sync_refresh_btn_visibility(self) -> None:
+        self._refresh_days_btn.setVisible(self._is_individual_fill())
+
+    def _on_method_changed(self) -> None:
+        """Смена метода заполнения: показать/скрыть «Обновить», запросить/снять блокировку."""
+        self._sync_refresh_btn_visibility()
+        self._sync_schedule_enabled()
+        if self._is_individual_fill():
+            self._maybe_request_day_states()
+        else:
+            self._unblock_all_days()
+
+    def _sync_schedule_enabled(self) -> None:
+        """Строка «Запланировать» неактивна в методе «Индивидуально» (только «По-умолчанию»)."""
+        active = not self._is_individual_fill()
+        self._schedule_check.setEnabled(active)
+        self._schedule_hint.setEnabled(active)
+        # Время доступно только когда строка активна И чекбокс отмечен.
+        self._schedule_time.setEnabled(active and self._schedule_check.isChecked())
+
+    def _maybe_request_day_states(self) -> None:
+        """Запросить статусы дней с портала (только в «Индивидуально»/fill)."""
+        if not self._is_individual_fill():
+            return
+        self.set_day_states_loading()
+        self.day_states_requested.emit()
+
+    def set_day_states_loading(self) -> None:
+        """Показать «загрузка…» и временно заблокировать чекбоксы дней (ожидание статусов)."""
+        self._days_caption.setText("ДНИ ДЛЯ ЗАПОЛНЕНИЯ · загрузка…")
+        for checkbox, _d, _info, _wrap, _desc, _hours, reason in self._day_rows:
+            checkbox.setEnabled(False)
+            reason.setVisible(False)
+
+    def apply_day_states(self, mapping: "dict | None") -> None:
+        """Применить карту статусов дней: недоступные → disabled + снять галку + причина.
+
+        Применяется ТОЛЬКО в методе «Индивидуально». ``mapping`` — ``{iso_date:
+        {"fillable": bool, "reason": str}}`` (из ``DayStatesWorker``). Отсутствующая в
+        карте дата трактуется как недоступная («нет данных»).
+        """
+        self._day_states = dict(mapping or {})
+        self._days_caption.setText("ДНИ ДЛЯ ЗАПОЛНЕНИЯ")
+        if not self._is_individual_fill():
+            # Метод переключили, пока грузились статусы — не блокируем.
+            self._unblock_all_days()
+            return
+        self._reapply_block_state()
+        self._refresh_day_rows()
+
+    def _reapply_block_state(self) -> None:
+        """Пере-применить последнюю карту статусов к чекбоксам (после busy/восстановления)."""
+        if self._day_states is None or not self._is_individual_fill():
+            return
+        for checkbox, d, _info, _wrap, _desc, _hours, reason in self._day_rows:
+            st = self._day_states.get(d.isoformat())
+            fillable = bool(st and st.get("fillable"))
+            if fillable:
+                checkbox.setEnabled(True)
+                checkbox.setToolTip("")
+                reason.setText("")
+                reason.setVisible(False)
+            else:
+                checkbox.setChecked(False)
+                checkbox.setEnabled(False)
+                text = (st or {}).get("reason") or "нет данных"
+                checkbox.setToolTip(text)
+                reason.setText(text)
+                reason.setVisible(True)
+
+    def apply_day_states_error(self) -> None:
+        """Фолбэк при ошибке загрузки статусов: вернуть чекбоксы в активное состояние."""
+        self._day_states = None
+        self._days_caption.setText("ДНИ ДЛЯ ЗАПОЛНЕНИЯ · не удалось получить статусы")
+        for checkbox, _d, _info, _wrap, _desc, _hours, reason in self._day_rows:
+            checkbox.setEnabled(True)
+            checkbox.setToolTip("")
+            reason.setText("")
+            reason.setVisible(False)
+
+    def _unblock_all_days(self) -> None:
+        """Снять любую блокировку дней (переход в «По-умолчанию»/export)."""
+        self._day_states = None
+        self._days_caption.setText("ДНИ ДЛЯ ЗАПОЛНЕНИЯ")
+        for checkbox, _d, _info, _wrap, _desc, _hours, reason in self._day_rows:
+            checkbox.setEnabled(True)
+            checkbox.setToolTip("")
+            reason.setText("")
+            reason.setVisible(False)
 
     # ------------------------------------------------------------------
     # Вспомогательные конструкторы
@@ -437,7 +575,7 @@ class ControlPanel(QWidget):
         """
         interactive = self._method_combo.currentData() == METHOD_INTERACTIVE
         out: "dict[date, tuple[str, float]]" = {}
-        for checkbox, d, _info, _wrap, desc_edit, hours_spin in self._day_rows:
+        for checkbox, d, _info, _wrap, desc_edit, hours_spin, _reason in self._day_rows:
             if not checkbox.isChecked():
                 continue
             if interactive:
@@ -472,6 +610,7 @@ class ControlPanel(QWidget):
             self._description,
             self._hours,
             self._schedule_check,
+            self._refresh_days_btn,
             self._cta,
         ]
         widgets.extend(checkbox for checkbox, *_ in self._day_rows)

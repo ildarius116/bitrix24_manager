@@ -47,22 +47,17 @@ from PySide6.QtWidgets import (
 from src.dates import today_moscow
 from src.logging_setup import SecretMaskingFilter
 
-from gui.confirm_dialog import ConfirmDialog
 from gui.console_panel import ConsolePanel
 from gui.control_panel import MODE_EXPORT, METHOD_INTERACTIVE, ControlPanel
 from gui.theme import resolve_effective, theme
 from gui.title_bar import TitleBar
-from gui.worker import ExportWorker, FillWorker, SmokeWorker
+from gui.worker import DayStatesWorker, ExportWorker, FillWorker, SmokeWorker
 
 APP_TITLE = "Bitrix24 — Рабочий день"
 
 # Корень проекта = родитель каталога gui/ (рядом с src/, config.yaml, out/).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ICONS_DIR = _PROJECT_ROOT / "resources" / "icons"
-
-# Маппинг action диалога подтверждения (ConfirmDialog) → choice, который ждёт
-# FillWorker.provide_confirmation (см. gui/worker.py).
-_ACTION_TO_CHOICE = {"ok": "ok", "apply_all": "all", "skip": "skip", "abort": "abort"}
 
 
 class MainWindow(QMainWindow):
@@ -76,6 +71,7 @@ class MainWindow(QMainWindow):
         self._export_worker: "ExportWorker | None" = None
         self._fill_worker: "FillWorker | None" = None
         self._smoke_worker: "SmokeWorker | None" = None
+        self._day_states_worker: "DayStatesWorker | None" = None
         self._busy = False
 
         self.setWindowTitle(APP_TITLE)
@@ -358,6 +354,32 @@ class MainWindow(QMainWindow):
     def _wire_signals(self) -> None:
         self._control.run_requested.connect(self._start_selected)
         self._control.mode_changed.connect(lambda _m: self._update_status_left())
+        self._control.day_states_requested.connect(self._start_day_states)
+
+    # ------------------------------------------------------------------
+    # Статусы дней окна (Часть A, метод «Индивидуально») — read-only
+    # ------------------------------------------------------------------
+    def _start_day_states(self) -> None:
+        """Запросить у портала доступность дней окна (блокировка недоступных чекбоксов).
+
+        Read-only: в прод не пишет. Guard: не запускать при активной операции или уже
+        бегущем воркере статусов (дубль-клик по «Обновить»).
+        """
+        if self._busy:
+            return
+        if self._day_states_worker is not None and self._day_states_worker.isRunning():
+            return
+        worker = DayStatesWorker(self._config)
+        worker.states_ready.connect(self._on_day_states_ready)
+        worker.states_failed.connect(self._on_day_states_failed)
+        self._day_states_worker = worker
+        worker.start()
+
+    def _on_day_states_ready(self, mapping: object) -> None:
+        self._control.apply_day_states(mapping if isinstance(mapping, dict) else {})
+
+    def _on_day_states_failed(self) -> None:
+        self._control.apply_day_states_error()
 
     def _start_selected(self) -> None:
         """CTA «Получить выписку»: запустить выбранный режим (export/fill)."""
@@ -370,7 +392,7 @@ class MainWindow(QMainWindow):
     # Export
     # ------------------------------------------------------------------
     def _start_export(self) -> None:
-        if self._busy:
+        if self._busy or self._day_states_running():
             return
         date_from = self._control.date_from()
         date_to = self._control.date_to()
@@ -393,19 +415,27 @@ class MainWindow(QMainWindow):
     # Fill
     # ------------------------------------------------------------------
     def _start_fill(self) -> None:
-        if self._busy:
+        if self._busy or self._day_states_running():
             return
         interaction = self._control.method() == METHOD_INTERACTIVE
         today: date = today_moscow()
 
         # Гейт §5: БЕЗУСЛОВНОЕ подтверждение боевого прогона — до старта воркера для
         # ОБОИХ методов. Причина: запись идёт не только при создании учётов, но и в
-        # «ремонте» (complete_day_activities → crm.activity.update, src/fill.py), который
-        # НЕ проходит через per-day ConfirmDialog. Раньше это прикрывал дефолтный dry-run;
-        # после его удаления единственная защита — этот явный диалог. Метод «Индивидуально»
-        # ДОПОЛНИТЕЛЬНО подтверждает создание учётов по дням (per-day ConfirmDialog).
+        # «ремонте» (complete_day_activities → crm.activity.update, src/fill.py). Раньше
+        # это прикрывал дефолтный dry-run; после его удаления единственная защита — этот
+        # явный диалог. Метод «Индивидуально» пишет ТОЛЬКО отмеченные дни (см. ниже).
         if not self._confirm_live_write():
             return
+
+        # Метод «Индивидуально»: источник выбора/значений — левая панель. Передаём
+        # отмеченные дни и их инлайн-значения в воркер; неотмеченные будут пропущены
+        # (_fake_input → "skip"). Для «По-умолчанию» — None (пишутся все кандидаты).
+        selected_days = None
+        per_day_values = None
+        if interaction:
+            selected_days = set(self._control.selected_days())
+            per_day_values = self._control.per_day_values()
 
         self._set_busy_ui(True)
         self.set_state("Заполнение…")
@@ -418,10 +448,11 @@ class MainWindow(QMainWindow):
             today=today,
             description=self._control.description(),
             hours=self._control.hours(),
+            selected_days=selected_days,
+            per_day_values=per_day_values,
         )
         worker.result_ready.connect(self._on_fill_result)
         worker.finished_code.connect(self._on_op_finished)
-        worker.confirm_requested.connect(self._on_confirm_requested)
         self._fill_worker = worker
         worker.start()
 
@@ -448,24 +479,6 @@ class MainWindow(QMainWindow):
     def _on_fill_result(self, rows: object) -> None:
         self._control.result_table().show_fill(rows)  # type: ignore[arg-type]
 
-    def _on_confirm_requested(self, day_info: object) -> None:
-        """Показать ``ConfirmDialog`` по дню и передать выбор пользователя воркеру.
-
-        Вызывается слотом сигнала ``confirm_requested`` (уже в main thread), поэтому
-        модальный ``exec()`` здесь безопасен. Маппинг action→choice — ``_ACTION_TO_CHOICE``.
-        """
-        info = day_info if isinstance(day_info, dict) else {}
-        result = ConfirmDialog.request_confirmation(info, parent=self)
-        choice = _ACTION_TO_CHOICE.get(result["action"], "abort")
-        if self._fill_worker is not None:
-            self._fill_worker.provide_confirmation(
-                {
-                    "choice": choice,
-                    "description": result["description"],
-                    "hours": result["hours"],
-                }
-            )
-
     # ------------------------------------------------------------------
     # Общие слоты операций
     # ------------------------------------------------------------------
@@ -485,23 +498,41 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     _CLOSE_WAIT_MS = 5000
 
-    def _active_worker(self):
-        """Вернуть запущенный воркер (fill/export/smoke) или None."""
-        for worker in (self._fill_worker, self._export_worker, self._smoke_worker):
-            if worker is not None and worker.isRunning():
-                return worker
-        return None
+    def _running_workers(self) -> list:
+        """Список ВСЕХ бегущих воркеров (fill/export/smoke/day-states)."""
+        return [
+            worker
+            for worker in (
+                self._fill_worker,
+                self._export_worker,
+                self._smoke_worker,
+                self._day_states_worker,
+            )
+            if worker is not None and worker.isRunning()
+        ]
+
+    def _day_states_running(self) -> bool:
+        """Идёт ли фоновое чтение статусов дней (read-only REST в отдельном QThread).
+
+        Гард для ``_start_fill``/``_start_export``: нельзя запускать запись/выгрузку, пока
+        DayStatesWorker занимает REST — иначе одновременно жили бы два QThread, что нарушает
+        инвариант глобального monkeypatch ``builtins.input`` в ``FillWorker``.
+        """
+        return (
+            self._day_states_worker is not None
+            and self._day_states_worker.isRunning()
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         """Не дать уничтожить QThread на ходу и не оставить утёкший monkeypatch.
 
-        Если воркер активен: для ``FillWorker`` сначала разблокируем возможное ожидание
-        подтверждения (``provide_confirmation({"choice":"abort"})`` — no-op, если воркер
-        не ждёт), затем ``quit()`` + ``wait(timeout)``. Если за таймаут воркер не
-        завершился — предупреждаем и оставляем окно открытым (``event.ignore()``).
+        Дожидаемся ВСЕХ бегущих воркеров (fill/export/smoke/day-states), а не только
+        первого: иначе ``DayStatesWorker`` мог бы остаться бежать → «QThread destroyed
+        while running». Для ``FillWorker`` сначала разблокируем возможное ожидание
+        (``provide_confirmation`` — no-op), затем ``quit()`` + ``wait(timeout)``. Если хоть
+        один воркер не завершился за таймаут — предупреждаем и оставляем окно (``ignore``).
         """
-        worker = self._active_worker()
-        if worker is not None:
+        for worker in self._running_workers():
             if isinstance(worker, FillWorker):
                 worker.provide_confirmation({"choice": "abort"})
             worker.quit()

@@ -193,7 +193,8 @@ bitrix24/
 │   ├── result_table.py     # QTableWidget/QTableView для результатов
 │   ├── detail_panel.py     # Панель деталей (правая)
 │   ├── log_panel.py        # Панель лога + QLoggingHandler
-│   ├── confirm_dialog.py   # Диалог подтверждения для fill
+│   ├── confirm_dialog.py   # Диалог подтверждения для fill (историческое: удалён в Фазе 8.01,
+│   │                       #   см. tasks_done/phase_8_done.md — план fill описан на момент Фазы 6)
 │   ├── worker.py           # QThread Workers для export и fill
 │   └── theme.py            # Подключение ThemeManager из USP
 ├── resources/

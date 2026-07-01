@@ -67,6 +67,8 @@ bitrix24/
 │   ├── detail_panel.py     # правая панель деталей выбранной строки
 │   ├── log_panel.py        # тёмный QTextEdit + QLoggingHandler (сигнал в main thread)
 │   ├── confirm_dialog.py   # QDialog подтверждения (день, описание, часы, 4 кнопки)
+│   │                       # ИСТОРИЧЕСКОЕ: удалён в Фазе 8.01 (per-day диалог заменён
+│   │                       #   перехватом input() по левой панели) — см. tasks_done/phase_8_done.md
 │   └── worker.py           # QThread воркеры export/fill + monkeypatch input()
 ├── resources/styles/main.qss   # копия из USP + селекторы bitrix24
 └── gui_main.py             # точка входа GUI
@@ -127,6 +129,9 @@ bitrix24/
   результата fill (status/reason/new_id/activity_status/activity_ids/verify_ok).
 
 ### Фаза GUI-4 — Диалог подтверждения + меню (coder-simple)
+> Историческая секция: per-day диалог, описанный ниже, реализован в Фазе 6, затем УДАЛЁН в
+> Фазе 8.01 (метод «Индивидуально» теперь пишет по выбору левой панели без диалога) — см.
+> `tasks_done/phase_8_done.md`. Текст ниже сохранён как есть, не переписан задним числом.
 - `gui/confirm_dialog.py`: `QDialog` (день+id, «Описание задачи» QLineEdit, «Количество часов»
   QDoubleSpinBox, кнопки [Пропустить][Применить ко всем][Отмена][OK]); возвращает структуру
   выбора в main_window, которая разблокирует воркер.

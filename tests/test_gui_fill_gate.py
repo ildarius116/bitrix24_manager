@@ -46,14 +46,29 @@ class _FakeFillWorker:
         self.interaction = interaction
         self.description = description
         self.hours = hours
+        self.selected_days = _k.get("selected_days")
+        self.per_day_values = _k.get("per_day_values")
         self.started = False
         self.result_ready = _FakeSignal()
         self.finished_code = _FakeSignal()
-        self.confirm_requested = _FakeSignal()
         _FakeFillWorker.instances.append(self)
 
     def start(self):
         self.started = True
+
+    def isRunning(self):
+        return False
+
+
+class _FakeDayStatesWorker:
+    """Стаб DayStatesWorker: не ходит в сеть/не запускает поток (Часть A не тестируем здесь)."""
+
+    def __init__(self, config, *_a, **_k):
+        self.states_ready = _FakeSignal()
+        self.states_failed = _FakeSignal()
+
+    def start(self):
+        return None
 
     def isRunning(self):
         return False
@@ -91,11 +106,14 @@ def _reset_instances():
 class TestFillSafetyGate:
     def _window(self, monkeypatch, method: str) -> MainWindow:
         cfg = _make_stub_config()
+        # Стабим воркеры ДО переключения метода: смена на «Индивидуально» дёргает
+        # DayStatesWorker (Часть A) — в этом тесте сеть/поток не нужны.
+        monkeypatch.setattr(mw, "FillWorker", _FakeFillWorker)
+        monkeypatch.setattr(mw, "DayStatesWorker", _FakeDayStatesWorker)
         window = MainWindow(cfg)
         window._control._apply_mode(MODE_FILL)
         combo = window._control._method_combo
         combo.setCurrentIndex(combo.findData(method))
-        monkeypatch.setattr(mw, "FillWorker", _FakeFillWorker)
         return window
 
     @pytest.mark.parametrize("method", [METHOD_AUTO, METHOD_INTERACTIVE])
