@@ -412,6 +412,66 @@ QDateEdit::drop-down, QComboBox::drop-down {
     width: 18px;
 }
 
+/* Выпадающий список комбобокса (иначе на тёмной теме — чёрное на чёрном) */
+QComboBox QAbstractItemView {
+    background: @bg_surface@;
+    color: @text@;
+    border: 1px solid @border@;
+    selection-background-color: @accent@;
+    selection-color: #ffffff;
+    outline: none;
+}
+
+/* ===== Диалоги (О программе, подтверждения) ===== */
+/* Без этих правил QMessageBox/QDialog наследуют только `color: @text@` от общего  */
+/* QWidget, но берут системный фон — на тёмной теме получается нечитаемо.          */
+QDialog, QMessageBox {
+    background: @bg_window@;
+}
+
+QDialog QLabel, QMessageBox QLabel {
+    color: @text@;
+    background: transparent;
+}
+
+/* Кнопки диалогов (OK/Отмена/подтверждение) — общий стиль, без objectName */
+QMessageBox QPushButton,
+QDialogButtonBox QPushButton {
+    min-width: 84px;
+    padding: 6px 16px;
+    border: 1px solid @border@;
+    border-radius: 4px;
+    background: @bg_surface@;
+    color: @text@;
+    font-size: 12px;
+}
+
+QMessageBox QPushButton:hover,
+QDialogButtonBox QPushButton:hover {
+    border-color: @accent@;
+    background: @hover@;
+}
+
+QMessageBox QPushButton:pressed,
+QDialogButtonBox QPushButton:pressed {
+    background: @accent_deep@;
+    color: #ffffff;
+}
+
+/* Кнопка по-умолчанию (акцент) */
+QMessageBox QPushButton:default,
+QDialogButtonBox QPushButton:default {
+    background: @accent@;
+    border-color: @accent@;
+    color: #ffffff;
+}
+
+QMessageBox QPushButton:default:hover,
+QDialogButtonBox QPushButton:default:hover {
+    background: @accent_hover@;
+    border-color: @accent_hover@;
+}
+
 /* ===== Scrollbar ===== */
 QScrollBar:vertical {
     background: transparent;

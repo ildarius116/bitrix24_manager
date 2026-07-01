@@ -477,10 +477,10 @@ class FillWorker(QThread):
         return missing
 
     def _apply_defaults_override(self) -> "Optional[Dict[str, Any]]":
-        """Временно подставить в cfg.defaults значения из диалога «Значения по-умолчанию».
+        """Временно подставить в cfg.defaults описание/часы, заданные в колонке «Редактирование».
 
         ``run_fill`` (src/fill.py, не меняем) берёт описание/часы из ``cfg.defaults``, а не
-        из аргументов. Чтобы значения SettingsDialog применялись и в методе «По-умолчанию»
+        из аргументов. Чтобы значения инлайн-полей применялись и в методе «По-умолчанию»
         (interaction=False, без per-day ConfirmDialog), временно переопределяем содержимое
         словаря ``cfg.defaults`` (мутируем сам dict — cfg может быть frozen dataclass, но
         сам словарь изменяемый) и восстанавливаем в ``run().finally`` через

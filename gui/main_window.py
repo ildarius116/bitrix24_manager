@@ -50,7 +50,6 @@ from src.logging_setup import SecretMaskingFilter
 from gui.confirm_dialog import ConfirmDialog
 from gui.console_panel import ConsolePanel
 from gui.control_panel import MODE_EXPORT, METHOD_INTERACTIVE, ControlPanel
-from gui.settings_dialog import SettingsDialog
 from gui.theme import resolve_effective, theme
 from gui.title_bar import TitleBar
 from gui.worker import ExportWorker, FillWorker, SmokeWorker
@@ -72,16 +71,6 @@ class MainWindow(QMainWindow):
     def __init__(self, config, parent: "QWidget | None" = None) -> None:
         super().__init__(parent)
         self._config = config
-
-        # Дефолты «Описание задачи»/«Часы» (диалог «Настройки → Значения по-умолчанию»).
-        # Начальные значения — из config.defaults; редактируются через SettingsDialog и
-        # применяются при заполнении (пре-филл ConfirmDialog / значения для FillWorker).
-        defaults = getattr(config, "defaults", {}) or {}
-        self._default_description = str(defaults.get("task_description", ""))
-        try:
-            self._default_hours = float(defaults.get("hours", 0) or 0)
-        except (TypeError, ValueError):
-            self._default_hours = 0.0
 
         # Ссылки на активные воркеры (чтобы их не собрал GC до завершения).
         self._export_worker: "ExportWorker | None" = None
@@ -128,10 +117,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_exit)
 
         # --- Настройки ---
+        # Дефолты «Описание/Часы» редактируются инлайн в колонке «Редактирование»
+        # (см. gui/control_panel.py); отдельного диалога «Значения по-умолчанию» нет —
+        # он дублировал те же поля.
         settings_menu = menubar.addMenu("Настройки")
-        act_defaults = QAction("Значения по-умолчанию…", self)
-        act_defaults.triggered.connect(self._edit_defaults)
-        settings_menu.addAction(act_defaults)
         act_portal = QAction("Портал и вебхук…", self)
         act_portal.triggered.connect(self._show_portal_info)
         settings_menu.addAction(act_portal)
@@ -211,18 +200,6 @@ class MainWindow(QMainWindow):
             self._theme_toggle.setIcon(QIcon(str(path)))
         else:
             self._theme_toggle.setText("☾" if effective != "dark" else "☀")
-
-    def _edit_defaults(self) -> None:
-        """Диалог «Значения по-умолчанию» — редактирует те же поля, что и в колонке
-        «Редактирование» (Описание/Часов по-умолчанию); они и применяются при заполнении.
-        """
-        result = SettingsDialog.edit_defaults(
-            self._control.description(), self._control.hours(), parent=self
-        )
-        if result is not None:
-            desc, hrs = result
-            self._control.set_description(desc)
-            self._control.set_hours(hrs)
 
     def _show_portal_info(self) -> None:
         """Read-only инфо о портале (домен и entityTypeId) БЕЗ кода вебхука."""

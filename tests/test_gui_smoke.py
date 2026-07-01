@@ -205,12 +205,13 @@ class TestWidgetSmokeInstantiation:
         assert "пробный" not in window._status_left.text().lower()
         assert "dry-run" not in window._status_left.text().lower()
 
-    def test_main_window_defaults_from_config(self, qapp):
-        """Дефолты «Описание/Часы» берутся из config.defaults и хранятся на окне."""
+    def test_main_window_defaults_seed_control_panel(self, qapp):
+        """Дефолты «Описание/Часы» из config.defaults попадают в инлайн-поля колонки
+        «Редактирование» (отдельного диалога «Значения по-умолчанию» больше нет)."""
         cfg = _make_stub_config()
         window = MainWindow(cfg)
-        assert window._default_description == "Общие задачи подразделения"
-        assert window._default_hours == 8.0
+        assert window._control.description() == "Общие задачи подразделения"
+        assert window._control.hours() == 8.0
 
     def test_main_window_no_smoke_worker_on_construction(self, qapp):
         """__init__ НЕ запускает smoke-проверку (сеть только по check_webhook())."""

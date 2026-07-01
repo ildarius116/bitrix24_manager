@@ -203,7 +203,7 @@ class TestAppliedToAllCache:
 
 
 class TestDefaultsOverride:
-    """SHOULD-FIX #2: значения SettingsDialog применяются к cfg.defaults и в auto.
+    """SHOULD-FIX #2: значения инлайн-полей «Редактирование» применяются к cfg.defaults и в auto.
 
     run_fill (src/fill.py, не меняем) читает описание/часы из cfg.defaults, а не из
     аргументов. FillWorker временно переопределяет cfg.defaults на время прогона и
