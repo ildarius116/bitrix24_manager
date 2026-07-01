@@ -78,6 +78,9 @@ def _make_cfg() -> types.SimpleNamespace:
         contract_tech_id="2",
         edit_window_days=4,
         activity_provider_id="CRM_TODO",
+        # «Тип дня» (ЭТАП B1): код поля + whitelist рабочих типов.
+        field_workday_day_type="ufCrm46_1742341877",
+        day_type_work_ids=[351],
         # дефолты
         defaults={"task_description": "Общие задачи подразделения", "hours": 8},
     )
@@ -88,14 +91,19 @@ def _make_day(
     d: Optional[date] = None,
     works_ids: Optional[List[int]] = None,
     title: str = "Сотрудник | 25.06.2026",
+    day_type_id: Optional[int] = 351,
 ) -> WorkdayDay:
-    """Вспомогательный конструктор WorkdayDay для тестов fill."""
+    """Вспомогательный конструктор WorkdayDay для тестов fill.
+
+    day_type_id по умолчанию 351 («Рабочий день»), чтобы дни проходили фильтр «Типа дня».
+    """
     return WorkdayDay(
         id=day_id,
         date=d if d is not None else TODAY,
         title=title,
         employee="1244",
         works_ids=works_ids if works_ids is not None else [],
+        day_type_id=day_type_id,
         raw={},
         logs=[],
     )
@@ -625,6 +633,17 @@ class TestRereadeGuard:
 class TestCreateLogDryRun:
     """dry_run=True: plan_only=True вызов, боевой add НЕ вызывается."""
 
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        """Зафиксировать «сегодня» для src.fill.today_moscow = 2026-06-25.
+
+        _reread_guard игнорирует переданный параметр `today` и берёт реальную
+        today_moscow() (см. докстринг _reread_guard в src/fill.py) — поэтому
+        тесты должны патчить именно src.fill.today_moscow, иначе при запуске
+        в реальную дату вне окна гард вернёт 'skipped' вместо ожидаемого статуса.
+        """
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
+
     def setup_method(self):
         self.cfg = _make_cfg()
         self.day = _make_day(day_id=20)
@@ -697,6 +716,11 @@ class TestCreateLogDryRun:
 
 class TestCreateLogLive:
     """dry_run=False: боевой add, статусы filled / error."""
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        """Зафиксировать «сегодня» для src.fill.today_moscow = 2026-06-25 (см. TestCreateLogDryRun)."""
+        monkeypatch.setattr("src.fill.today_moscow", lambda: date(2026, 6, 25))
 
     def setup_method(self):
         self.cfg = _make_cfg()
@@ -1027,7 +1051,7 @@ class TestRunFillJournal:
         day = _make_day(day_id=100, d=TODAY)
 
         # Мокаем read_days и select_candidates: один подходящий день
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
         monkeypatch.setattr(
             "src.workday.select_candidates",
             lambda days, cfg, today, limit=5: days,
@@ -1072,7 +1096,7 @@ class TestRunFillJournal:
         cfg = self._setup_cfg()
         day = _make_day(day_id=100, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
         monkeypatch.setattr(
             "src.workday.select_candidates",
             lambda days, cfg, today, limit=5: days,
@@ -1140,7 +1164,7 @@ class TestRunFillJournal:
         cfg = self._setup_cfg()
         day = _make_day(day_id=100, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
         monkeypatch.setattr(
             "src.workday.select_candidates",
             lambda days, cfg, today, limit=5: days,
@@ -1192,7 +1216,7 @@ class TestRunFillJournal:
         """Если кандидатов нет — is_processed и mark_processed не вызываются."""
         cfg = self._setup_cfg()
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [])
         monkeypatch.setattr(
             "src.workday.select_candidates",
             lambda days, cfg, today, limit=5: [],
@@ -1236,7 +1260,7 @@ class TestRunFillJournal:
         day1 = _make_day(day_id=100, d=TODAY)
         day2 = _make_day(day_id=101, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day1, day2])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day1, day2])
         monkeypatch.setattr(
             "src.workday.select_candidates",
             lambda days, cfg, today, limit=5: days,
@@ -1531,7 +1555,7 @@ class TestRunFillRepair:
         repair_day = _make_day(day_id=200, d=TODAY, works_ids=[100])
 
         # Только repair-день (no candidates because works_ids is non-empty)
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [repair_day])
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
         monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
@@ -1562,7 +1586,7 @@ class TestRunFillRepair:
         cfg = self._setup_cfg()
         repair_day = _make_day(day_id=201, d=TODAY, works_ids=[101])
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [repair_day])
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
         monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
@@ -1589,7 +1613,7 @@ class TestRunFillRepair:
         cfg = self._setup_cfg()
         repair_day = _make_day(day_id=202, d=TODAY, works_ids=[102])
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [repair_day])
         # dry_run=True → load_journal не нужен
 
         window_resp = {"id": 202, cfg.field_workday_date: TODAY.isoformat()}
@@ -1618,7 +1642,7 @@ class TestRunFillRepair:
 
         monkeypatch.setattr(
             "src.workday.read_days",
-            lambda b24, cfg, df, dt: [candidate_day, repair_day],
+            lambda b24, cfg, df, dt, **kw: [candidate_day, repair_day],
         )
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         # Параметры journal, day_id, ttl_sec, now_ts — передаются с keyword-аргументами
@@ -1649,7 +1673,7 @@ class TestRunFillRepair:
         # Только repair-день (works непуст → select_candidates его не возьмёт)
         repair_day = _make_day(day_id=300, d=TODAY, works_ids=[999])
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [repair_day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [repair_day])
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         monkeypatch.setattr("src.fill.is_processed", lambda j, d, t, n: False)
         monkeypatch.setattr("src.fill.mark_processed", lambda *a, **kw: None)
@@ -1691,7 +1715,7 @@ class TestRunFillCreatePathActivity:
         cfg = self._setup_cfg()
         day = _make_day(day_id=100, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         monkeypatch.setattr(
             "src.fill.is_processed",
@@ -1745,7 +1769,7 @@ class TestRunFillCreatePathActivity:
         cfg = self._setup_cfg()
         day = _make_day(day_id=100, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
         monkeypatch.setattr("src.fill.load_journal", lambda path=None: {})
         monkeypatch.setattr(
             "src.fill.is_processed",
@@ -1796,7 +1820,7 @@ class TestRunFillCreatePathActivity:
         cfg = self._setup_cfg()
         day = _make_day(day_id=100, d=TODAY)
 
-        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt: [day])
+        monkeypatch.setattr("src.workday.read_days", lambda b24, cfg, df, dt, **kw: [day])
 
         cfg_ns = cfg
         b24 = FakeB24(

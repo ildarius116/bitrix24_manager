@@ -13,7 +13,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -66,6 +66,8 @@ class Config:
     defaults: Dict[str, Any] = field(default_factory=dict)
     export: Dict[str, Any] = field(default_factory=dict)
     runtime: Dict[str, Any] = field(default_factory=dict)
+    # Настройки отбора «Рабочего дня» (whitelist «Типа дня» для fill и т.п.).
+    workday: Dict[str, Any] = field(default_factory=dict)
     contract_general_tasks: str = ""
     edit_window_days: int = 4
     # Провайдер CRM-дела «Заполнить работы по договорам» (завершение = «Выполнено», FR-2.1.7).
@@ -97,6 +99,36 @@ class Config:
     @property
     def field_workday_employee(self) -> str:
         return str(self.fields["workday_employee"])
+
+    @property
+    def field_workday_day_type(self) -> str:
+        """Код поля «Тип дня» (ufCrm46_1742341877). Пусто, если не задан в config.yaml.
+
+        Возвращает "" при отсутствии ключа, чтобы export продолжал работать на минимальной
+        конфигурации (read_days тогда не добавляет поле/фильтр типа дня).
+        """
+        return str(self.fields.get("workday_day_type", ""))
+
+    @property
+    def day_type_work_ids(self) -> List[int]:
+        """Whitelist «рабочих» типов дня для отбора кандидатов на заполнение (fill).
+
+        Числовые ID справочника (по умолчанию [351] «Рабочий день», см. config.yaml).
+        Значения приводятся к int; мусор отбрасывается. При пустом/некорректном списке —
+        безопасный откат к [351], чтобы фильтр никогда не «раскрывался» на все типы.
+        """
+        raw = self.workday.get("day_type_work_ids", [351])
+        if not isinstance(raw, (list, tuple)):
+            raw = [raw]
+        result: List[int] = []
+        for value in raw:
+            if isinstance(value, bool):  # bool — подкласс int, отсекаем явно
+                continue
+            try:
+                result.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return result or [351]
 
     @property
     def field_log_parent(self) -> str:
@@ -245,6 +277,7 @@ def load_config(
         defaults=data.get("defaults") or {},
         export=data.get("export") or {},
         runtime=data.get("runtime") or {},
+        workday=data.get("workday") or {},
         contract_general_tasks=str(data.get("contract_general_tasks", "")),
         edit_window_days=int(data.get("edit_window_days", 4)),
         activity_provider_id=str(data.get("activity_provider_id", "CRM_TODO")),

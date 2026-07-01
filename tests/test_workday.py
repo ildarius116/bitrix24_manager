@@ -18,8 +18,9 @@ from src.workday import WorkdayDay, WorkLog, data_time_range, select_candidates,
 # Фиксированная «сегодня» для детерминированных тестов select_candidates.
 TODAY = date(2026, 6, 25)
 
-# Стаб Config: функция select_candidates использует только cfg.edit_window_days.
-_cfg = types.SimpleNamespace(edit_window_days=4)
+# Стаб Config: select_candidates/select_repair_days используют edit_window_days и
+# day_type_work_ids (whitelist «Типа дня», ЭТАП B1).
+_cfg = types.SimpleNamespace(edit_window_days=4, day_type_work_ids=[351])
 
 
 def _log(desc: str, hours, *, log_id: int = 0) -> WorkLog:
@@ -35,23 +36,25 @@ def _log(desc: str, hours, *, log_id: int = 0) -> WorkLog:
     )
 
 
-def _day(d, logs, *, day_id: int = 1) -> WorkdayDay:
+def _day(d, logs, *, day_id: int = 1, day_type_id: int = 351) -> WorkdayDay:
     return WorkdayDay(
         id=day_id,
         date=d,
         title="Сотрудник | x",
         employee="1244",
         works_ids=[l.id for l in logs],
+        day_type_id=day_type_id,
         raw={},
         logs=logs,
     )
 
 
-def _bare_day(d, *, day_id: int = 1, works_ids=None) -> WorkdayDay:
-    """Создать WorkdayDay без учётов, с явным контролем works_ids.
+def _bare_day(d, *, day_id: int = 1, works_ids=None, day_type_id: int = 351) -> WorkdayDay:
+    """Создать WorkdayDay без учётов, с явным контролем works_ids и «Типа дня».
 
     Используется в тестах select_candidates: нужны дни только с датой и
-    works_ids, без реальных WorkLog-объектов.
+    works_ids, без реальных WorkLog-объектов. day_type_id по умолчанию 351
+    («Рабочий день»), чтобы день проходил фильтр «Типа дня» (ЭТАП B1).
     """
     return WorkdayDay(
         id=day_id,
@@ -59,6 +62,7 @@ def _bare_day(d, *, day_id: int = 1, works_ids=None) -> WorkdayDay:
         title="Сотрудник | x",
         employee="1244",
         works_ids=works_ids if works_ids is not None else [],
+        day_type_id=day_type_id,
         raw={},
         logs=[],
     )
@@ -266,6 +270,54 @@ def test_select_candidates_all_dates_in_window_all_pass():
 
 
 # ---------------------------------------------------------------------------
+# select_candidates — фильтр «Типа дня» (ЭТАП B1, whitelist=[351])
+# ---------------------------------------------------------------------------
+
+
+def test_select_candidates_work_day_type_passes():
+    """Рабочий день (day_type_id=351) в окне с пустым works — проходит."""
+    day = _bare_day(TODAY, day_id=10, day_type_id=351)
+    assert select_candidates([day], _cfg, TODAY) == [day]
+
+
+def test_select_candidates_vacation_excluded():
+    """Отпуск (352) — пропускается, даже если день в окне и пустой."""
+    day = _bare_day(TODAY, day_id=11, day_type_id=352)
+    assert select_candidates([day], _cfg, TODAY) == []
+
+
+def test_select_candidates_non_work_types_excluded():
+    """355 (отгул), 356 (работа в выходной), 357 (удалёнка) — все пропускаются."""
+    for dt in (355, 356, 357):
+        day = _bare_day(TODAY, day_id=100 + dt, day_type_id=dt)
+        assert select_candidates([day], _cfg, TODAY) == [], f"тип {dt} не должен проходить"
+
+
+def test_select_candidates_unknown_type_excluded():
+    """Неизвестный тип (напр. 999, не в whitelist) — пропускается."""
+    day = _bare_day(TODAY, day_id=12, day_type_id=999)
+    assert select_candidates([day], _cfg, TODAY) == []
+
+
+def test_select_candidates_empty_type_excluded():
+    """Пустой/неизвестный тип (day_type_id=None) — пропускается."""
+    day = _bare_day(TODAY, day_id=13, day_type_id=None)
+    assert select_candidates([day], _cfg, TODAY) == []
+
+
+def test_select_candidates_daytype_filter_mixed():
+    """Смешанный список: только рабочий день (351) с пустым works попадает в кандидаты."""
+    days = [
+        _bare_day(TODAY, day_id=1, day_type_id=352),   # отпуск → пропуск
+        _bare_day(TODAY, day_id=2, day_type_id=357),   # удалёнка → пропуск
+        _bare_day(TODAY, day_id=3, day_type_id=351),   # рабочий → кандидат
+        _bare_day(TODAY, day_id=4, day_type_id=None),  # нет типа → пропуск
+    ]
+    result = select_candidates(days, _cfg, TODAY)
+    assert [d.id for d in result] == [3]
+
+
+# ---------------------------------------------------------------------------
 # select_repair_days (FR-2.1.7): зеркало select_candidates, но берёт заполненные дни
 # today=2026-06-25, edit_window_days=4 → earliest=2026-06-21
 # ---------------------------------------------------------------------------
@@ -346,3 +398,76 @@ def test_select_repair_days_mixed_days():
     ]
     result = select_repair_days(days, _cfg, TODAY)
     assert [d.id for d in result] == [2, 5]
+
+
+def test_select_repair_days_vacation_type_excluded():
+    """Ремонт консистентен с whitelist: отпуск (352) с учётом не попадает в ремонт."""
+    day = _bare_day(TODAY, day_id=7, works_ids=[70], day_type_id=352)
+    assert select_repair_days([day], _cfg, TODAY) == []
+
+
+# ---------------------------------------------------------------------------
+# read_days — серверный фильтр по «Типу дня» (ЭТАП B1) и разбор day_type_id
+# ---------------------------------------------------------------------------
+
+
+class _FakeB24List:
+    """Мок B24: фиксирует параметры item_list_all и возвращает заранее заданные items."""
+
+    def __init__(self, items):
+        self._items = items
+        self.calls = []
+
+    def item_list_all(self, entity_type_id, *, filter=None, select=None, order=None):
+        self.calls.append(
+            {"entity_type_id": entity_type_id, "filter": filter, "select": select, "order": order}
+        )
+        return self._items
+
+
+_DAY_TYPE_FIELD = "ufCrm46_1742341877"
+
+# Стаб Config для read_days: только используемые геттеры/поля.
+_read_cfg = types.SimpleNamespace(
+    workday_type_id=1208,
+    field_workday_date="ufCrm46_1742342657",
+    field_workday_works="ufCrm46_1742997115",
+    field_workday_employee="ufCrm46_1742341577",
+    field_workday_day_type=_DAY_TYPE_FIELD,
+    day_type_work_ids=[351],
+)
+
+
+def test_read_days_adds_server_daytype_filter():
+    """day_type_ids передан → серверный фильтр {"@<код>": [...]} присутствует в запросе."""
+    from src.workday import read_days
+    b24 = _FakeB24List(items=[])
+    read_days(b24, _read_cfg, date(2026, 6, 21), date(2026, 6, 25), day_type_ids=[351])
+    flt = b24.calls[0]["filter"]
+    assert flt[f"@{_DAY_TYPE_FIELD}"] == [351]
+    # Поле «Типа дня» также попадает в select (для клиентской проверки/аудита).
+    assert _DAY_TYPE_FIELD in b24.calls[0]["select"]
+
+
+def test_read_days_no_daytype_filter_for_export():
+    """Без day_type_ids (export) серверного фильтра по типу дня НЕТ, но поле в select есть."""
+    from src.workday import read_days
+    b24 = _FakeB24List(items=[])
+    read_days(b24, _read_cfg, date(2026, 6, 1), date(2026, 6, 25))
+    flt = b24.calls[0]["filter"]
+    assert f"@{_DAY_TYPE_FIELD}" not in flt
+    assert _DAY_TYPE_FIELD in b24.calls[0]["select"]
+
+
+def test_read_days_parses_day_type_id():
+    """day_type_id разбирается из ответа портала (число/строка) в int, пусто → None."""
+    from src.workday import read_days
+    items = [
+        {"id": 1, _DAY_TYPE_FIELD: 351},
+        {"id": 2, _DAY_TYPE_FIELD: "352"},
+        {"id": 3, _DAY_TYPE_FIELD: ""},
+    ]
+    b24 = _FakeB24List(items=items)
+    days = read_days(b24, _read_cfg, date(2026, 6, 21), date(2026, 6, 25))
+    by_id = {d.id: d.day_type_id for d in days}
+    assert by_id == {1: 351, 2: 352, 3: None}

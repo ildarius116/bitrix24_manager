@@ -1,0 +1,454 @@
+/* ===== Bitrix24 «Рабочий день» — Main QSS (шаблон с токенами) ===== */
+/* Фаза 7: переверстан под макет design/bitrix24-console-standalone.html.        */
+/* Плейсхолдеры (собака-имя-собака) подставляются ThemeManager.apply() из PALETTES.*/
+/* Радиусы (Fluent): xs 2, sm 3, md 4, lg 5, pill 7, round 9.                     */
+/* Тени QSS не умеет — они реализуются QGraphicsDropShadowEffect в коде.          */
+
+/* ===== General ===== */
+QWidget {
+    font-family: "Segoe UI", Tahoma, sans-serif;
+    font-size: 12px;
+    color: @text@;
+}
+
+QMainWindow {
+    background: @bg_window@;
+}
+
+/* ===== Menu Bar ===== */
+QMenuBar {
+    background: @bg_surface@;
+    border-bottom: 1px solid @border@;
+    padding: 2px 8px;
+    min-height: 28px;
+    font-size: 12px;
+    color: @text_secondary@;
+}
+
+QMenuBar::item {
+    padding: 4px 10px;
+    background: transparent;
+    border-radius: 4px;
+}
+
+QMenuBar::item:selected {
+    background: @menu_hover@;
+}
+
+QMenu {
+    background: @bg_surface@;
+    border: 1px solid @border@;
+    padding: 4px 0;
+}
+
+QMenu::item {
+    padding: 5px 30px 5px 20px;
+}
+
+QMenu::item:selected {
+    background: @hover@;
+    color: @accent@;
+}
+
+QMenu::item:disabled {
+    color: @text_muted@;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: @border@;
+    margin: 4px 8px;
+}
+
+/* --- Правый угол меню: тумблер темы + индикатор вебхука --- */
+QWidget#MenuCorner {
+    background: transparent;
+}
+
+QToolButton#ThemeToggle {
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 4px;
+}
+
+QToolButton#ThemeToggle:hover {
+    background: @menu_hover@;
+}
+
+QLabel#WebhookIndicator {
+    font-size: 11px;
+    font-weight: 600;
+    color: @text_muted@;
+    padding: 2px 6px;
+}
+
+QLabel#WebhookIndicator[status="ok"] {
+    color: @status_ok@;
+}
+
+QLabel#WebhookIndicator[status="fail"] {
+    color: @status_fail@;
+}
+
+QLabel#WebhookIndicator[status="unknown"] {
+    color: @text_muted@;
+}
+
+/* ===== Синий баннер-заголовок (под системной рамкой) ===== */
+QWidget#TitleBar {
+    background: @accent@;
+    border-bottom: 1px solid @accent_deep@;
+}
+
+QLabel#TitleBarLabel {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+
+/* ===== Левая колонка управления ===== */
+QWidget#ControlPanel {
+    background: @bg_surface@;
+    border-right: 1px solid @border@;
+}
+
+/* --- Переключатель режима (mutually exclusive) --- */
+QPushButton#ModeButtonExport,
+QPushButton#ModeButtonFill {
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid @border@;
+    border-radius: 5px;
+    background: @bg_surface@;
+    color: @text_secondary@;
+}
+
+QPushButton#ModeButtonExport:hover,
+QPushButton#ModeButtonFill:hover {
+    border-color: @accent@;
+    background: @hover@;
+}
+
+QPushButton#ModeButtonExport:checked,
+QPushButton#ModeButtonFill:checked {
+    background: @accent@;
+    border-color: @accent@;
+    color: #ffffff;
+}
+
+/* --- Метки полей / период --- */
+QLabel#FieldLabel {
+    color: @text_medium@;
+    font-size: 12px;
+}
+
+QLabel#PeriodLabel {
+    color: @text_faint@;
+    font-size: 12px;
+    padding: 2px 0;
+}
+
+QLabel#PeriodLabel:disabled {
+    color: @input_disabled@;
+}
+
+/* --- Секция «Редактирование» (метод/записей/расписание, только режим fill) --- */
+QFrame#EditSection {
+    background: @surface_raised@;
+    border: 1px solid @border_light@;
+    border-radius: 5px;
+}
+
+QLabel#SectionCaption {
+    color: @text_muted@;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+QLabel#FillHint {
+    color: @status_warning@;
+    font-size: 11px;
+}
+
+/* Инфо-значения «Записей к созданию» / «Расписание» */
+QLabel#InfoValue {
+    color: @text_secondary@;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* --- Пилюли-тумблеры метода (По-умолчанию / Индивидуально) --- */
+QPushButton#MethodPill {
+    padding: 5px 14px;
+    font-size: 12px;
+    border: 1px solid @border@;
+    border-radius: 7px;
+    background: @bg_surface@;
+    color: @text_medium@;
+}
+
+QPushButton#MethodPill:hover {
+    border-color: @accent@;
+}
+
+QPushButton#MethodPill:checked {
+    background: @accent_soft@;
+    border-color: @accent@;
+    color: @accent_deep@;
+    font-weight: 600;
+}
+
+/* --- CTA «Получить выписку» --- */
+QPushButton#CtaButton {
+    padding: 11px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #ffffff;
+    background: @accent@;
+    border: 1px solid @accent@;
+    border-radius: 5px;
+}
+
+QPushButton#CtaButton:hover {
+    background: @accent_hover@;
+    border-color: @accent_hover@;
+}
+
+QPushButton#CtaButton:pressed {
+    background: @accent_deep@;
+}
+
+QPushButton#CtaButton:disabled {
+    background: @btn_disabled_bg@;
+    border-color: @border@;
+    color: @text_muted@;
+}
+
+/* ===== Правая тёмная консоль (всегда тёмная независимо от темы) ===== */
+QWidget#ConsolePanel {
+    background: @log_bg@;
+}
+
+QWidget#ConsolePanel QLabel {
+    color: @log_text@;
+}
+
+QLabel#ConsoleHeader {
+    color: @text_muted@;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+QLabel#ProgressPercent {
+    color: @log_text@;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+QLabel#ConsoleStatus {
+    color: @text_muted@;
+    font-size: 11px;
+}
+
+QProgressBar#ConsoleProgress {
+    border: none;
+    border-radius: 5px;
+    background: #2a2a2a;
+    max-height: 8px;
+    min-height: 8px;
+    text-align: center;
+}
+
+QProgressBar#ConsoleProgress::chunk {
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 @accent@, stop:1 @brand_cyan@);
+}
+
+QLabel#JournalFilterIcon {
+    color: @text_muted@;
+    font-size: 12px;
+}
+
+QLabel#JournalCounter {
+    color: @text_muted@;
+    font-size: 11px;
+}
+
+QPushButton#JournalIconBtn {
+    background: transparent;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 12px;
+    color: @log_text@;
+}
+
+QPushButton#JournalIconBtn:hover {
+    background: #2f2f2f;
+    border-color: @accent@;
+}
+
+/* Пилюли-фильтры журнала (Все/REST/OK/Ошибки) — на тёмном фоне */
+QPushButton#JournalPill {
+    padding: 4px 12px;
+    font-size: 11px;
+    border: 1px solid #3a3a3a;
+    border-radius: 7px;
+    background: transparent;
+    color: @text_muted@;
+}
+
+QPushButton#JournalPill:hover {
+    border-color: @accent@;
+    color: @log_text@;
+}
+
+QPushButton#JournalPill:checked {
+    background: @accent@;
+    border-color: @accent@;
+    color: #ffffff;
+    font-weight: 600;
+}
+
+QTextEdit#ConsoleLog {
+    background: @log_bg@;
+    color: @log_text@;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 10px;
+    border: 1px solid #333333;
+    border-radius: 5px;
+    padding: 8px 10px;
+    selection-background-color: @log_selection@;
+}
+
+/* ===== Статусбар (нейтральная бледная полоса, не accent) ===== */
+QStatusBar#MainStatusBar {
+    background: @surface_raised@;
+    border-top: 1px solid @border@;
+    color: @text_muted@;
+    padding: 2px 12px;
+}
+
+QStatusBar#MainStatusBar::item {
+    border: none;
+}
+
+QLabel#StatusLabel {
+    color: @text_muted@;
+    font-size: 11px;
+}
+
+/* ===== Splitter ===== */
+QSplitter#MainSplitter::handle:horizontal {
+    background: @border@;
+    width: 2px;
+}
+
+QSplitter#MainSplitter::handle:horizontal:hover {
+    background: @accent@;
+}
+
+/* ===== Таблица результатов ===== */
+QTableWidget#ResultTable, QTableView {
+    background: @bg_surface@;
+    alternate-background-color: @bg_surface_alt@;
+    border: 1px solid @border_light@;
+    border-radius: 5px;
+    gridline-color: @border_light@;
+    font-size: 11px;
+}
+
+QTableWidget#ResultTable::item:selected, QTableView::item:selected {
+    background: @accent_soft@;
+    color: @text@;
+}
+
+QHeaderView::section {
+    background: @table_header_bg@;
+    padding: 5px 6px;
+    font-weight: 600;
+    color: @text_secondary@;
+    border: none;
+    border-right: 1px solid @border_light@;
+    border-bottom: 1px solid @border@;
+    font-size: 11px;
+}
+
+/* ===== Инпуты (даты, описание, часы) ===== */
+QLineEdit, QDateEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+    padding: 5px 8px;
+    border: 1px solid @border@;
+    border-radius: 4px;
+    background: @bg_surface@;
+    font-size: 12px;
+    selection-background-color: @accent@;
+}
+
+QLineEdit:focus,
+QDateEdit:focus,
+QDoubleSpinBox:focus,
+QSpinBox:focus,
+QComboBox:focus {
+    border-color: @accent@;
+}
+
+QLineEdit:disabled,
+QDateEdit:disabled,
+QDoubleSpinBox:disabled,
+QSpinBox:disabled,
+QComboBox:disabled {
+    background: @bg_surface_alt@;
+    color: @input_disabled@;
+}
+
+QDateEdit::drop-down, QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+
+/* ===== Scrollbar ===== */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: @scrollbar@;
+    border-radius: 5px;
+    min-height: 24px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: @scrollbar_hover@;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:horizontal {
+    background: @scrollbar@;
+    border-radius: 5px;
+    min-width: 24px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: @scrollbar_hover@;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}

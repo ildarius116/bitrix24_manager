@@ -80,6 +80,26 @@ def _as_float(value: Any) -> Optional[float]:
     return None
 
 
+def _as_int_or_none(value: Any) -> Optional[int]:
+    """Привести значение поля-справочника (напр. «Тип дня») к int; None/пусто/мусор → None.
+
+    Bitrix отдаёт iblock_element как числовой ID (число или строку). bool отсекаем явно.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):  # bool — подкласс int, отсекаем явно
+        return None
+    if isinstance(value, (list, tuple)):
+        # На всякий случай: одиночное значение справочника может прийти списком из одного.
+        value = value[0] if value else None
+        if value in (None, ""):
+            return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _id_list(value: Any) -> List[int]:
     """Нормализовать значение crm[]-поля (работы) к списку int ID.
 
@@ -158,6 +178,9 @@ class WorkdayDay:
     title: str
     employee: str
     works_ids: List[int]
+    # «Тип дня» (числовой ID справочника iblock 27): 351 «Рабочий день», 352 «Отпуск» и т.д.
+    # None — поле пусто/не читалось. Используется фильтром отбора кандидатов на заполнение.
+    day_type_id: Optional[int] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     logs: List[WorkLog] = field(default_factory=list)
 
@@ -172,24 +195,44 @@ class WorkdayDay:
         d = entry_date(item, date_field=config.field_workday_date)
         if d is None:
             d = extract_date(title)
+        # «Тип дня» читаем, только если код поля задан в конфиге (иначе None — export на
+        # минимальной конфигурации не должен падать/тянуть лишнее).
+        day_type_field = config.field_workday_day_type
+        day_type_id = (
+            _as_int_or_none(item.get(day_type_field)) if day_type_field else None
+        )
         return cls(
             id=day_id,
             date=d,
             title=title,
             employee=_as_str(item.get(config.field_workday_employee)),
             works_ids=_id_list(item.get(config.field_workday_works)),
+            day_type_id=day_type_id,
             raw=item,
         )
 
 
-def read_days(b24: B24, config: Config, date_from: date, date_to: date) -> List[WorkdayDay]:
+def read_days(
+    b24: B24,
+    config: Config,
+    date_from: date,
+    date_to: date,
+    *,
+    day_type_ids: Optional[List[int]] = None,
+) -> List[WorkdayDay]:
     """Прочитать все дни «Рабочий день» (1208) за период [date_from; date_to].
 
     Фильтр по полю даты (>=/<=), сортировка id desc, ПОЛНАЯ пагинация (item_list_all).
     Коды полей — из Config. Возвращает список WorkdayDay (без учётов; их грузит read_logs).
+
+    Параметр `day_type_ids` (опционально) включает СЕРВЕРНЫЙ фильтр по «Типу дня»
+    (`{"@<код>": [...]}` — IN по числовым ID справочника). Задаётся пайплайном заполнения
+    (fill), чтобы отпуск/отгул/нерабочие типы не попадали в кандидаты. Для export НЕ
+    передаётся — выгрузка Excel показывает все типы дней. Фильтр применяется, только если
+    список непуст И код поля «Тип дня» задан в конфиге.
     """
     date_field = config.field_workday_date
-    flt = {
+    flt: Dict[str, Any] = {
         f">={date_field}": date_from.isoformat(),
         f"<={date_field}": date_to.isoformat(),
     }
@@ -200,6 +243,20 @@ def read_days(b24: B24, config: Config, date_from: date, date_to: date) -> List[
         config.field_workday_works,
         config.field_workday_employee,
     ]
+
+    day_type_field = config.field_workday_day_type
+    if day_type_field:
+        # Всегда читаем «Тип дня» (нужен клиентскому фильтру и для аудита), если код задан.
+        select.append(day_type_field)
+        if day_type_ids:
+            # Серверный фильтр IN по числовым ID справочника (Bitrix фильтрует по этому полю).
+            flt[f"@{day_type_field}"] = list(day_type_ids)
+            log.info(
+                "read_days: серверный фильтр по «Типу дня» %s = %s.",
+                day_type_field,
+                list(day_type_ids),
+            )
+
     items = b24.item_list_all(
         config.workday_type_id,
         filter=flt,
@@ -300,6 +357,32 @@ def data_time_range(days: List[WorkdayDay]) -> Tuple[Optional[date], Optional[da
     return min(dated), max(dated), len(dated)
 
 
+def _day_type_allowed(day: WorkdayDay, whitelist: List[int], *, log_skip: bool = True) -> bool:
+    """Клиентская защитная проверка «Типа дня»: True — день рабочий (в whitelist).
+
+    Дублирует серверный фильтр read_days (belt-and-suspenders): даже если сервер вернул
+    лишнее (или whitelist не был передан в read_days), нерабочие типы (отпуск/отгул/
+    работа-в-выходной/удалёнка) и неизвестный/пустой тип (day_type_id is None) отсекаются.
+
+    `log_skip` управляет логированием пропуска. select_candidates и select_repair_days
+    вызываются по одному и тому же списку дней, поэтому лог пишем только в ОДНОМ проходе
+    (основной путь заполнения — select_candidates), иначе нерабочий день попал бы в лог
+    дважды за один прогон. select_repair_days фильтрует тихо (log_skip=False).
+    """
+    if day.day_type_id in whitelist:
+        return True
+    if log_skip:
+        date_str = day.date.isoformat() if day.date else "нет даты"
+        log.info(
+            "День id=%d (%s) пропущен: тип дня %s не входит в рабочие (whitelist=%s).",
+            day.id,
+            date_str,
+            day.day_type_id if day.day_type_id is not None else "не задан",
+            whitelist,
+        )
+    return False
+
+
 def select_candidates(
     days: List[WorkdayDay],
     cfg: Config,
@@ -330,6 +413,7 @@ def select_candidates(
     Возвращает список отобранных WorkdayDay (может быть пустым).
     """
     earliest: date = today - timedelta(days=cfg.edit_window_days)
+    work_type_ids = cfg.day_type_work_ids
     candidates: List[WorkdayDay] = []
 
     for day in days[:limit]:
@@ -340,6 +424,11 @@ def select_candidates(
                 day.id,
                 day.title,
             )
+            continue
+
+        # Фильтр «Типа дня» (ЭТАП B1): заполняем учёт только для рабочих дней; отпуск/отгул/
+        # работа-в-выходной/удалёнка и неизвестный тип — пропуск (защита от отбора отпускных дней).
+        if not _day_type_allowed(day, work_type_ids):
             continue
 
         # FR-2.1.3: вне окна редактирования.
@@ -401,10 +490,17 @@ def select_repair_days(
     Возвращает список WorkdayDay (может быть пустым).
     """
     earliest: date = today - timedelta(days=cfg.edit_window_days)
+    work_type_ids = cfg.day_type_work_ids
     repair: List[WorkdayDay] = []
 
     for day in days[:limit]:
         if day.date is None:
+            continue
+        # Тот же whitelist «Типа дня», что и для создания (консистентность): «ремонт» закрывает
+        # дело только у рабочих дней. Отпускной день с учётом маловероятен, но проверка безопаснее.
+        # Логируем пропуск тихо (log_skip=False): тот же день уже залогирован в select_candidates —
+        # избегаем двойного INFO за один прогон.
+        if not _day_type_allowed(day, work_type_ids, log_skip=False):
             continue
         if not (earliest <= day.date <= today):
             continue

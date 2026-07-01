@@ -1,6 +1,6 @@
 # Фаза 6 — GUI: десктопная обёртка PySide6 над export/fill
 
-**Статус:** TODO
+**Статус:** DONE — отчёт: `../tasks_done/phase_6_done.md` (2026-06-30)
 **Зависит от:** Фазы 1–5 (DONE) — GUI только вызывает готовые модули `src/`.
 **Связано:** `GUI_SPEC.md`, `PLAN_GUI.md`, макет `design/bitrix24-console-standalone.html`.
 

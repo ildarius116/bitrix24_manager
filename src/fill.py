@@ -678,7 +678,9 @@ def run_fill(
     journal = load_journal() if not dry_run else {}
 
     date_from = today - timedelta(days=cfg.edit_window_days + 3)
-    days = read_days(b24, cfg, date_from, today)
+    # Серверный фильтр по «Типу дня» (ЭТАП B1): отпуск/отгул/нерабочие типы не тянем с портала.
+    # select_candidates/select_repair_days дублируют проверку на клиенте (защита belt-and-suspenders).
+    days = read_days(b24, cfg, date_from, today, day_type_ids=cfg.day_type_work_ids)
     candidates = select_candidates(days, cfg, today, limit=limit)
     repair_days = select_repair_days(days, cfg, today, limit=limit)
 
