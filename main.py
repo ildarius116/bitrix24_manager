@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""CLI «Рабочий день» Bitrix24: подкоманды export / fill.
+"""Единая точка входа Bitrix24 «Рабочий день»: GUI или CLI.
 
-Фаза 1 (Каркас + REST-обёртка): тела export/fill — заглушки. Общий старт делает:
+Диспетчеризация по аргументам командной строки:
+- **без аргументов** (`python main.py`) — запускается графический интерфейс (GUI, PySide6);
+- **с подкомандой** (`python main.py export …` / `fill …`) — командная строка (CLI).
+
+CLI (подкоманды export / fill) на общем старте делает:
 1. загрузку конфигурации (src.config.load_config) — секрет берётся из .env, не печатается;
 2. инициализацию логирования (src.logging_setup) с маскированием кода вебхука;
 3. read-only smoke-проверку доступа к порталу (user.current) перед работой.
 
+GUI — только презентационная обёртка над тем же ядром `src/` (см. `gui/`); бизнес-логика
+в обоих режимах общая.
+
 Безопасность (CLAUDE.md §4, §5): код вебхука — СЕКРЕТ, не печатается и маскируется
-в логах. Записей в прод нет: вызывается только read-only user.current. crm.item.add
-на этой фазе не выполняется.
+в логах. В CLI-режиме перед работой вызывается только read-only user.current.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description="Bitrix24 «Рабочий день»: выгрузка (export) и автозаполнение (fill).",
+        epilog="Без подкоманды (просто `python main.py`) запускается графический интерфейс (GUI).",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="{export,fill}")
 
@@ -276,7 +283,63 @@ def _cmd_fill(config: Config, args: argparse.Namespace) -> int:
     return 2 if has_errors else 0
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _run_gui() -> int:
+    """Запуск графического интерфейса (PySide6). Импорты Qt — ленивые.
+
+    Повторяет порядок старта CLI (load_config → setup_logging), но ошибку конфигурации
+    показывает в диалоге, а не печатает в консоль. Smoke-проверка доступа выполняется
+    окном в фоне (индикатор вебхука) уже после показа — здесь её не дублируем.
+    """
+    # PySide6 импортируется только в GUI-режиме, чтобы CLI не требовал Qt.
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Bitrix24 — Рабочий день")
+
+    # Конфигурацию грузим после создания QApplication, чтобы ошибку показать в диалоге.
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        QMessageBox.critical(
+            None,
+            "Ошибка конфигурации",
+            f"Не удалось загрузить конфигурацию:\n\n{exc}",
+        )
+        return 2
+    except Exception as exc:  # неожиданная ошибка — тоже показать пользователю
+        QMessageBox.critical(
+            None,
+            "Ошибка запуска",
+            f"Непредвиденная ошибка при инициализации:\n\n{exc}",
+        )
+        return 1
+
+    # Логирование с маскированием кода вебхука (как в CLI): консоль + out/run.log.
+    setup_logging(secret_literals=(config.env.webhook_code,))
+    # Доп. защита: фильтр на самом логгере «workday» гарантирует, что лог-панель GUI
+    # (handler на этом логгере) получает уже замаскированные записи — фильтр логгера
+    # отрабатывает до вызова любых handler-ов.
+    from src.logging_setup import SecretMaskingFilter
+
+    logging.getLogger("workday").addFilter(
+        SecretMaskingFilter((config.env.webhook_code,))
+    )
+
+    # Импортируем тему и окно после успешной конфигурации.
+    from gui.main_window import MainWindow
+    from gui.theme import theme
+
+    window = MainWindow(config)
+    theme.apply(app, "system")
+    window.show()
+
+    # Индикатор вебхука: фоновая read-only smoke-проверка ПОСЛЕ показа окна.
+    window.check_webhook()
+
+    return app.exec()
+
+
+def _run_cli(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -312,6 +375,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     parser.print_help()
     return 1
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Диспетчер: без аргументов — GUI, с подкомандой export/fill — CLI.
+
+    ``argv`` по умолчанию берётся из ``sys.argv``. Пустой список аргументов
+    (запуск без параметров) открывает графический интерфейс; любые аргументы
+    (подкоманда, флаги, ``-h``) обрабатываются командной строкой.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        return _run_gui()
+    return _run_cli(argv)
 
 
 if __name__ == "__main__":

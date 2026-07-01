@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
     def check_webhook(self) -> None:
         """Запустить фоновую smoke-проверку доступа (обновит индикатор вебхука).
 
-        Вызывается из ``gui_main`` после показа окна (не из ``__init__``), чтобы
+        Вызывается из ``main._run_gui`` после показа окна (не из ``__init__``), чтобы
         GUI-тесты, конструирующие ``MainWindow`` со стаб-конфигом, не делали сети.
         """
         if self._smoke_worker is not None and self._smoke_worker.isRunning():

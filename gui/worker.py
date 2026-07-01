@@ -11,7 +11,7 @@
 -----------
 Воркеры пишут в ``logging.getLogger("workday")`` — лог-панель уже подключена к нему
 (``LogPanel.attach``). Свой лог-сигнал не дублируем. Секрет вебхука в логах
-маскируется ``SecretMaskingFilter`` (см. ``gui_main`` / ``src.logging_setup``).
+маскируется ``SecretMaskingFilter`` (см. ``main._run_gui`` / ``src.logging_setup``).
 
 Интерактивный fill
 ------------------
